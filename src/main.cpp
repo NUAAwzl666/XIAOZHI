@@ -88,6 +88,9 @@ uint8_t* recordBuffer = nullptr;
 size_t recordedSize = 0;
 String fullRecognizedText = "";  // 存储完整识别结果
 
+// 系统初始化状态
+bool systemFullyInitialized = false;  // 标记系统是否完全初始化完成
+
 // 扬声器输出状态
 static bool speakerInitialized = false;
 
@@ -680,7 +683,7 @@ String chatWithDeepSeek(const String& message) {
     String jsonBody = "{";
     jsonBody += "\"model\":\"deepseek-chat\",";
     jsonBody += "\"messages\":[";
-    jsonBody += "{\"role\":\"system\",\"content\":\"你是语音助手小智，由南京航空航天大学的武同学基于deepseek改造而成，可以与人交流。请用简洁友好的语气回答问题。\"},";
+    jsonBody += "{\"role\":\"system\",\"content\":\"你是一个有用的AI助手。请简洁回答。\"},";
     jsonBody += "{\"role\":\"user\",\"content\":\"" + message + "\"}";
     jsonBody += "],";
     jsonBody += "\"max_tokens\":50,";
@@ -698,21 +701,8 @@ String chatWithDeepSeek(const String& message) {
     
     Serial.println("[DeepSeek] 等待响应...");
     
-    // 等待响应数据就绪
-    unsigned long timeout = millis();
-    while (!client.available() && millis() - timeout < 5000) {
-        delay(10);
-    }
-    
-    if (!client.available()) {
-        Serial.println("[DeepSeek] 响应超时");
-        client.stop();
-        return "网络响应超时";
-    }
-    
     // 读取响应状态行
     String statusLine = client.readStringUntil('\n');
-    statusLine.trim();
     Serial.printf("[DeepSeek] 状态行: %s\n", statusLine.c_str());
     
     // 检查HTTP状态码
@@ -751,22 +741,7 @@ String chatWithDeepSeek(const String& message) {
     
     if (chunked) {
         // 处理分块传输
-        Serial.println("[DeepSeek] 开始读取分块数据...");
-        unsigned long chunkTimeout = millis();
-        
-        while (client.connected() || client.available()) {
-            // 超时保护
-            if (millis() - chunkTimeout > 10000) {
-                Serial.println("[DeepSeek] 分块读取超时");
-                break;
-            }
-            
-            // 等待数据可用
-            if (!client.available()) {
-                delay(10);
-                continue;
-            }
-            
+        while (client.available() || client.connected()) {
             String chunkSizeLine = client.readStringUntil('\n');
             chunkSizeLine.trim();
             
@@ -776,22 +751,16 @@ String chatWithDeepSeek(const String& message) {
             Serial.printf("[DeepSeek] 块大小: %d bytes\n", chunkSize);
             
             if (chunkSize == 0) {
-                Serial.println("[DeepSeek] 收到最后一个块，传输完成");
                 break; // 最后一个块
             }
             
-            // 读取块数据
             char* buffer = new char[chunkSize + 1];
             int bytesRead = client.readBytes(buffer, chunkSize);
             buffer[bytesRead] = '\0';
             responseBody += String(buffer);
             delete[] buffer;
             
-            // 读取块后的CRLF
-            client.readStringUntil('\n');
-            
-            // 重置超时计时器
-            chunkTimeout = millis();
+            client.readStringUntil('\n'); // 读取块后的CRLF
         }
     } else if (contentLength > 0) {
         // 使用Content-Length读取
