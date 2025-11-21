@@ -50,44 +50,79 @@ bool BaiduRealtimeASR::connect() {
         return true;
     }
     
+    // 先断开旧连接
+    webSocket.disconnect();
+    delay(100);
+    
     // 生成会话ID
     sessionId = generateSessionId();
     
     Serial.println("[REALTIME-ASR] 正在连接WebSocket服务器...");
     Serial.printf("[REALTIME-ASR] Session ID: %s\n", sessionId.c_str());
+    Serial.printf("[REALTIME-ASR] 可用内存: %d bytes\n", ESP.getFreeHeap());
     
     // 配置WebSocket
     // wss://vop.baidu.com/realtime_asr?sn=XXXX-XXXX-XXXX-XXX
     String path = "/realtime_asr?sn=" + sessionId;
     
+    Serial.printf("[REALTIME-ASR] 连接到: wss://vop.baidu.com:443%s\n", path.c_str());
+    
+    // 配置SSL - 跳过证书验证（适用于ESP32）
     webSocket.beginSSL("vop.baidu.com", 443, path);
+    
+    // 设置事件回调
     webSocket.onEvent(std::bind(&BaiduRealtimeASR::webSocketEventStatic, 
                                 std::placeholders::_1, 
                                 std::placeholders::_2, 
                                 std::placeholders::_3));
-    webSocket.setReconnectInterval(0);  // 禁用自动重连，手动管理连接
     
-    // 等待连接（最多5秒）
+    // 禁用自动重连，手动管理连接
+    webSocket.setReconnectInterval(0);
+    
+    // 配置心跳和超时参数
+    webSocket.enableHeartbeat(15000, 3000, 2);  // 15秒心跳，3秒超时，2次失败断开
+    
+    // 等待连接（增加到10秒，首次SSL握手需要更长时间）
     unsigned long startTime = millis();
-    while (!connected && millis() - startTime < 5000) {
+    int loopCount = 0;
+    Serial.println("[REALTIME-ASR] 等待WebSocket连接...");
+    
+    while (!connected && millis() - startTime < 10000) {
         webSocket.loop();
-        delay(10);
-    }    if (connected) {
+        delay(50);  // 适当增加延迟，给SSL握手更多时间
+        
+        loopCount++;
+        if (loopCount % 20 == 0) {  // 每秒打印一次进度
+            Serial.printf("[REALTIME-ASR] 连接中... %.1fs\n", (millis() - startTime) / 1000.0);
+        }
+    }
+    
+    if (connected) {
         Serial.println("[REALTIME-ASR] ✓ WebSocket连接成功");
+        Serial.printf("[REALTIME-ASR] 连接耗时: %lu ms\n", millis() - startTime);
         return true;
     } else {
         lastError = "WebSocket连接超时";
         Serial.println("[REALTIME-ASR] ✗ WebSocket连接失败");
+        Serial.printf("[REALTIME-ASR] 连接尝试时间: %lu ms\n", millis() - startTime);
+        webSocket.disconnect();  // 清理失败的连接
         return false;
     }
 }
 
 void BaiduRealtimeASR::disconnect() {
+    Serial.println("[REALTIME-ASR] 断开WebSocket连接");
+    
+    // 先发送结束帧（如果已连接）
     if (connected) {
-        Serial.println("[REALTIME-ASR] 断开WebSocket连接");
-        webSocket.disconnect();
-        connected = false;
+        finish();
+        delay(100);  // 等待结束帧发送
     }
+    
+    webSocket.disconnect();
+    connected = false;
+    
+    Serial.println("[REALTIME-ASR] ✓ WebSocket已断开");
 }
 
 bool BaiduRealtimeASR::isConnected() {
@@ -105,7 +140,10 @@ void BaiduRealtimeASR::webSocketEvent(WStype_t type, uint8_t* payload, size_t le
         case WStype_DISCONNECTED:
             // 只在第一次断开时打印,避免频繁输出
             if (connected) {
-                Serial.println("[REALTIME-ASR] WebSocket断开连接");
+                Serial.println("[REALTIME-ASR] ⚠️ WebSocket断开连接");
+                if (payload && length > 0) {
+                    Serial.printf("[REALTIME-ASR] 断开原因: %s\n", (char*)payload);
+                }
                 connected = false;
                 lastReconnectAttempt = millis();  // 记录断开时间
                 if (disconnectedCallback) {
@@ -115,18 +153,28 @@ void BaiduRealtimeASR::webSocketEvent(WStype_t type, uint8_t* payload, size_t le
             break;
             
         case WStype_CONNECTED:
-            Serial.println("[REALTIME-ASR] WebSocket已连接");
-            connected = true;
-            
-            // 发送开始帧
-            if (sendStartFrame()) {
-                Serial.println("[REALTIME-ASR] ✓ 开始帧发送成功");
-                if (connectedCallback) {
-                    connectedCallback();
+            {
+                Serial.println("[REALTIME-ASR] ✓ WebSocket已连接");
+                if (payload && length > 0) {
+                    Serial.printf("[REALTIME-ASR] 服务器URL: %s\n", (char*)payload);
                 }
-            } else {
-                Serial.println("[REALTIME-ASR] ✗ 开始帧发送失败");
-                lastError = "发送开始帧失败";
+                connected = true;
+                
+                // 稍微延迟一下再发送开始帧，确保连接稳定
+                delay(100);
+                
+                // 发送开始帧
+                if (sendStartFrame()) {
+                    Serial.println("[REALTIME-ASR] ✓ 开始帧发送成功");
+                    if (connectedCallback) {
+                        connectedCallback();
+                    }
+                } else {
+                    Serial.println("[REALTIME-ASR] ✗ 开始帧发送失败");
+                    lastError = "发送开始帧失败";
+                    // 发送失败，主动断开连接
+                    webSocket.disconnect();
+                }
             }
             break;
             
@@ -140,23 +188,27 @@ void BaiduRealtimeASR::webSocketEvent(WStype_t type, uint8_t* payload, size_t le
             
         case WStype_BIN:
             // 不应该收到二进制消息
-            Serial.println("[REALTIME-ASR] ⚠️ 收到意外的二进制消息");
+            Serial.printf("[REALTIME-ASR] ⚠️ 收到意外的二进制消息，长度: %d bytes\n", length);
             break;
             
         case WStype_ERROR:
-            Serial.printf("[REALTIME-ASR] ✗ WebSocket错误: %s\n", payload);
-            lastError = String((char*)payload);
+            Serial.printf("[REALTIME-ASR] ✗ WebSocket错误: %s\n", payload ? (char*)payload : "Unknown");
+            lastError = payload ? String((char*)payload) : "Unknown error";
             if (errorCallback) {
                 errorCallback(-1, lastError);
             }
             break;
             
         case WStype_PING:
-            Serial.println("[REALTIME-ASR] 收到PING");
+            Serial.println("[REALTIME-ASR] ← 收到PING");
             break;
             
         case WStype_PONG:
-            Serial.println("[REALTIME-ASR] 收到PONG");
+            Serial.println("[REALTIME-ASR] ← 收到PONG");
+            break;
+            
+        default:
+            Serial.printf("[REALTIME-ASR] ⚠️ 未处理的WebSocket事件类型: %d\n", type);
             break;
     }
 }

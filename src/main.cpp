@@ -1914,6 +1914,11 @@ void setup() {
     Serial.println("[WIFI] Starting WiFi connection...");
     Serial.printf("[WIFI] SSID: %s\n", WIFI_SSID);
     Serial.println("[WIFI] Connecting...");
+    
+    // 断开之前的连接，清除缓存
+    WiFi.disconnect(true);
+    delay(100);
+    
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
@@ -1922,7 +1927,8 @@ void setup() {
     
     int attempts = 0;
     unsigned long wifiStartTime = millis();
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    // 增加超时时间到150次循环 = 15秒（首次连接需要更多时间）
+    while (WiFi.status() != WL_CONNECTED && attempts < 150) {
         delay(100);
         updateLED();  // 更新LED状态
         
@@ -1933,7 +1939,7 @@ void setup() {
         
         // Show progress every 5 seconds
         if (attempts % 50 == 0) {
-            Serial.printf("\n[WIFI] Connection attempt %d/300 (%.1fs)...", attempts, attempts/10.0);
+            Serial.printf("\n[WIFI] Connection attempt %d/150 (%.1fs)...", attempts, attempts/10.0);
         }
     }
     
