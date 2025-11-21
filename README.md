@@ -1,115 +1,282 @@
- # ESP32-S3智能语音助手"小智"
+# ESP32-S3 智能语音助手"小智"
 
-## 项目概述
+基于ESP32-S3的实时语音识别AI助手，支持边录边识别、DeepSeek AI对话和百度TTS语音合成。
 
-这是一个基于ESP32-S3-N8R2开发板的智能语音助手项目，集成了多种硬件模块和AI服务，能够实现语音唤醒、语音识别、AI对话和语音合成的完整流程。
+## ✨ 主要特性
 
-## 硬件配置
+- 🎤 **实时语音识别**：百度实时ASR，边录边识别，低延迟
+- 🤖 **AI智能对话**：DeepSeek API，简洁准确的回复
+- 🔊 **流式语音合成**：百度TTS流式播放，即合成即播放
+- 💾 **低内存占用**：4KB音频缓冲，实时流式处理，可用内存234KB
+- 📡 **WiFi智能管理**：3秒断开检测，音频警告提示
+- 🎛️ **一键操作**：Boot按钮录音，LED状态指示
 
-- **开发板**: ESP32-S3-N8R2 (8MB Flash, 2MB PSRAM)
-- **麦克风**: 441麦克风模块 (I2S接口)
-- **音频功放**: 98357音频功放模块 (I2S接口)
-- **指示灯**: LED灯 (WS2812B)
+## 🔧 硬件清单
+
+| 组件 | 型号 | 用途 |
+|------|------|------|
+| 开发板 | ESP32-S3-DevKitC-1-N8 | 主控（8MB Flash）|
+| 麦克风 | INMP441 | I2S数字麦克风 |
+| 功放 | MAX98357A | I2S音频功放 |
+| LED | 任意颜色 | 状态指示（GPIO48，无需电阻）|
+| 按钮 | Boot按钮 | 录音控制（GPIO1）|
+
+## 📊 系统性能
+
+### 内存使用
+```
+初始可用：238KB
+运行时：  234KB（4KB缓冲区）
+对话后：  >150KB（稳定）
+提升：    +60KB vs 旧版本（34%改善）
+```
+
+### 响应速度
+```
+WiFi检测：  3秒
+录音启动：  <40ms
+WebSocket： ~1秒
+识别延迟：  实时（<100ms/块）
+```
+
+### 音频质量
+```
+采样率：    16kHz
+位深：      16-bit
+声道：      单声道（播放时扩展为立体声）
+增益：      1.5倍（适度放大，无失真）
+```
 
 ## 引脚连接
 
-### I2S麦克风 (441模块)
+### I2S麦克风 (INMP441)
 - WS (LRCLK): GPIO45
 - SCK (BCLK): GPIO21
 - SD (DIN): GPIO47
+- VDD: 3.3V
+- GND: GND
 
-### I2S音频功放 (98357模块)
-- WS (LRCLK): GPIO42
-- SCK (BCLK): GPIO41
-- SD (DIN): GPIO40
+### I2S音频功放 (MAX98357A)
+- LRC: GPIO42
+- BCLK: GPIO41
+- DIN: GPIO40
+- VIN: 5V
+- GND: GND
 
-### LED灯 (红色二极管)
+### LED指示灯
+- GPIO48 → LED正极
+- GND → LED负极（无需电阻）
 
-**方案一 (推荐)**: 使用限流电阻
-- 长脚(正极): GPIO48 → 220Ω电阻 → LED长脚
-- 短脚(负极): GND
 
-### 外部按钮 (语音对话触发)
-- 按钮一端: GPIO1
-- 按钮另一端: GND
-- 说明: 使用内部上拉电阻，无需外部电阻
+## 🚀 快速开始
 
-**方案二 (无电阻)**: 软件限流
-- 长脚(正极): GPIO48 (直接连接，软件限制亮度到30%)
-- 短脚(负极): GND
+### 1. 安装PlatformIO
+```bash
+# VS Code中安装PlatformIO扩展
+# 或使用命令行
+pip install platformio
+```
 
-## 功能特性
+### 2. 克隆项目
+```bash
+git clone https://github.com/your-repo/xiaozhi-ai.git
+cd xiaozhi-ai
+```
 
-## 功能特性
+### 3. 配置API密钥
+```bash
+# 复制配置模板
+cp include/config.example.h include/config.h
 
-### ✅ 已完成功能
-- **硬件驱动**
-  - ESP32-S3-N8R2开发板支持
-  - 441麦克风模块集成（I2S接口）
-  - 98357音频功放模块集成（I2S接口）
-  - LED状态指示灯（支持软件限流保护）
+# 编辑config.h，填入你的API密钥：
+# - WiFi SSID和密码
+# - DeepSeek API密钥
+# - 百度AI API密钥和Secret Key
+```
 
-- **交互控制**
-  - 外部按钮控制语音对话
-  - 一键触发语音识别
-  - LED状态指示反馈
-  - 防抖处理确保稳定性
+### 4. 编译上传
+```bash
+# 编译
+pio run
 
-- **网络连接**
-  - WiFi自动连接和重连
-  - 快速断网检测(3秒响应)
-  - 网络断开声音警告(3声蜂鸣)
-  - 初始化期间WiFi实时监控
-  - 网络状态监控
-  - 连接质量评估
+# 上传
+pio run --target upload
 
-- **系统监控**
-  - 实时内存使用监控
-  - 硬件信息显示
-  - WiFi连接状态追踪
-  - 心跳监控（30秒间隔）
-  - 系统状态报告
+# 监控串口
+pio device monitor
+```
 
-- **调试功能**
-  - 详细的串口输出
-  - 交互式命令界面
-  - 系统诊断工具
-  - 错误日志记录
+## 💬 使用方法
 
-- **🤖 AI智能对话**
-  - DeepSeek AI对话服务 ✅ 已集成
-  - 智能中文对话
-  - 上下文理解
-  - 友好的助手角色
-  - 实时对话计数
+### 基本操作
+1. **开机**：上电后自动连接WiFi
+2. **录音**：按住Boot按钮说话（LED常亮）
+3. **识别**：松开按钮，系统自动识别并回复
+4. **播放**：扬声器播放AI回复（LED闪烁3次表示完成）
 
-### 🔄 开发中功能
-- **语音识别与合成**
-  - 百度语音识别API集成
-  - 百度语音合成API集成
-  - 语音唤醒检测（"小智"、"你好"等）
-  - 完整语音交互流程
+### 串口命令
+```bash
+help         # 显示帮助信息
+status       # 系统状态
+wifi         # WiFi信息
+memory       # 内存信息
+restart      # 重启系统
+ping         # 测试响应
+ttsstream 你好 # 测试TTS播放
+```
 
-### 📋 可用命令
-通过串口监视器可以使用以下命令：
-- `status` - 显示系统详细状态（包含AI状态）
-- `wifi` - 显示WiFi连接信息
-- `memory` - 显示内存使用情况
-- `led` - 测试LED灯功能
-- `ai` - 显示AI服务状态
-- `test` - 测试AI服务连接
-- `chat [消息]` - 与AI对话（例如：chat 你好）
-- `help` - 显示所有可用命令
-- `restart` - 重启系统
+### LED状态
+```
+熄灭     - 待机
+常亮     - 正在录音
+快闪     - 错误/警告
+慢闪3次  - 对话完成
+```
 
-### 💬 AI对话功能
-- **直接对话**: 在串口中直接输入中文即可与小智对话
-- **智能回复**: AI会给出简洁友好的中文回复
-- **状态监控**: 实时显示对话次数和AI服务状态
+## 📁 项目结构
 
-## AI服务配置
+```
+xiaozhi-ai/
+├── src/
+│   └── main.cpp              # 主程序
+├── include/
+│   ├── config.h              # 配置文件（API密钥）
+│   └── config.example.h      # 配置模板
+├── lib/
+│   ├── BaiduSpeech/          # 百度语音库（TTS）
+│   ├── BaiduRealtimeASR/     # 百度实时识别库
+│   ├── DeepSeekClient/       # DeepSeek AI客户端
+│   ├── AudioManager/         # 音频管理
+│   └── LEDManager/           # LED控制
+├── docs/                     # 文档目录
+│   ├── README.md            # 文档索引
+│   ├── CHANGELOG_2025-11-21.md  # 最新更新日志
+│   ├── setup/               # 安装指南
+│   ├── hardware/            # 硬件指南
+│   ├── ai/                  # AI功能文档
+│   └── troubleshooting/     # 故障排除
+├── platformio.ini           # PlatformIO配置
+└── README.md               # 本文件
+```
 
-### DeepSeek AI
+## 🔄 最近更新（2025-11-21）
+
+### 重大改进
+- ✅ **删除非实时模式**：仅保留实时流式识别
+- ✅ **内存优化**：可用内存提升60KB（34%）
+- ✅ **TTS噪音修复**：消除音频噪音和失真
+- ✅ **WiFi快速检测**：3秒检测+音频警告
+- ✅ **录音时长延长**：15秒上限
+
+### 技术亮点
+```cpp
+// 实时流式处理
+audioBufferSize = 4096;  // 仅4KB
+边录边发 + 栈上临时缓冲 = 零累积
+
+// 内存及时释放
+aiResponse = String();
+fullRecognizedText = String();
+doc.clear();
+
+// 奇数字节对齐
+if (hasRemainingByte) {
+    merged[0] = remainingByte;
+    memcpy(merged + 1, data, len);
+}
+```
+
+详见：[更新日志](./docs/CHANGELOG_2025-11-21.md)
+
+## 📖 文档
+
+- [快速开始](./docs/setup/QUICKSTART.md)
+- [实时识别指南](./docs/ai/REALTIME_ASR_GUIDE.md)
+- [内存优化方案](./docs/ai/MEMORY_OPTIMIZATION.md)
+- [硬件连接](./docs/hardware/EXTERNAL_BUTTON_GUIDE.md)
+- [故障排除](./docs/troubleshooting/)
+- [完整文档索引](./docs/README.md)
+
+## 🐛 常见问题
+
+### WiFi连接失败
+```bash
+# 检查配置
+确认config.h中SSID和密码正确
+检查WiFi信号强度
+
+# 播放警告音
+系统会播放3次800Hz蜂鸣音
+```
+
+### 识别不准确
+```bash
+# 优化建议
+1. 靠近麦克风10-20cm
+2. 环境安静，减少噪音
+3. 说话清晰，语速适中
+4. 录音时长2-5秒最佳
+```
+
+### 内存不足
+```bash
+# 监控内存
+输入 memory 查看内存状态
+
+# 低于70KB时自动清理
+[MAINTENANCE] 内存不足，执行紧急清理...
+
+# 建议每24小时重启一次
+```
+
+### 音频噪音
+```bash
+# 已修复的问题
+✓ TTS奇数字节对齐
+✓ 增益过高失真
+✓ DMA缓冲区噪音
+
+# 如仍有噪音
+1. 检查功放供电（5V稳定）
+2. 检查地线连接
+3. 降低音量测试
+```
+
+## 🤝 贡献
+
+欢迎提交Issue和Pull Request！
+
+### 开发流程
+1. Fork项目
+2. 创建特性分支
+3. 提交代码
+4. 推送到分支
+5. 创建Pull Request
+
+### 代码规范
+- 使用Arduino风格
+- 添加注释说明
+- 更新相关文档
+
+## 📄 许可证
+
+MIT License
+
+## 🙏 致谢
+
+- [ESP32-Arduino](https://github.com/espressif/arduino-esp32)
+- [百度AI开放平台](https://ai.baidu.com/)
+- [DeepSeek AI](https://www.deepseek.com/)
+- [PlatformIO](https://platformio.org/)
+
+## 📞 联系方式
+
+- Issue: [GitHub Issues](https://github.com/your-repo/xiaozhi-ai/issues)
+- 文档: [docs/](./docs/)
+
+---
+
+**小智AI** - 让语音交互更简单 🎙️✨
 1. 注册DeepSeek账号：https://platform.deepseek.com
 2. 获取API密钥
 3. 在`include/config.h`中配置`DEEPSEEK_API_KEY`

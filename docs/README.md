@@ -15,11 +15,15 @@
   - RAW格式优化说明: ./ai/RAW_FORMAT_OPTIMIZATION.md
   - RAW格式测试指南: ./ai/RAW_FORMAT_TEST_GUIDE.md
   - 语音识别优化方案: ./ai/SPEECH_OPTIMIZATION_PLAN.md
-  - 改进总结（本次迭代）: ./IMPROVEMENTS_2025-11-18.md
+  - 内存优化方案: ./ai/MEMORY_OPTIMIZATION.md
 
 - 故障排除
   - 语音录音问题修复: ./troubleshooting/VOICE_RECORDING_FIX.md
   - 实时识别问题诊断与修复: ./troubleshooting/REALTIME_DEBUG_FIXES.md
+
+- 更新日志
+  - 2025-11-21 实时模式优化: ./CHANGELOG_2025-11-21.md
+  - 2025-11-18 改进总结: ./IMPROVEMENTS_2025-11-18.md
 
 - 项目状态与总结
   - 项目状态: ./PROJECT_STATUS.md
