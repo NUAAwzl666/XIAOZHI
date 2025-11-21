@@ -42,6 +42,6 @@
 #define WAKE_WORD         "小智"
 #define SILENCE_TIMEOUT   3000  // 静默超时时间(ms)
 #define MIN_RECORD_TIME   500   // 最小录音时间(ms) - 降低到0.5秒
-#define MAX_RECORD_TIME   2000  // 最大录音时间(ms) - 降低到2秒以节省内存（RAW格式优化）
+#define MAX_RECORD_TIME   10000  // 最大录音时间(ms) - 10秒，避免按键后无响应
 
 #endif

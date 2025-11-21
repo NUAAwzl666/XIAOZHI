@@ -39,9 +39,6 @@ void setupAudio();
 void setupBaiduSpeech();
 void setupRealtimeASR();
 void testBaiduSpeech();
-void startVoiceRecording();
-void stopVoiceRecording();
-void processVoiceInput();
 void startRealtimeRecording();
 void stopRealtimeRecording();
 void startVoiceConversation();
@@ -82,10 +79,6 @@ BaiduSpeech baiduSpeech;
 BaiduRealtimeASR realtimeASR;
 bool speechInitialized = false;
 bool realtimeASRInitialized = false;
-bool useRealtimeASR = true;  // 默认使用实时识别
-uint8_t* audioBuffer = nullptr;
-size_t audioBufferSize = 0;
-uint8_t* recordBuffer = nullptr;
 size_t recordedSize = 0;
 String fullRecognizedText = "";  // 存储完整识别结果
 
@@ -259,6 +252,13 @@ void handleButtonPress() {
         return;
     }
     
+    // 确保之前的WebSocket已完全断开
+    if (realtimeASR.isConnected()) {
+        Serial.println("[BUTTON] 检测到旧的WebSocket连接，先断开...");
+        realtimeASR.disconnect();
+        delay(200);  // 给予充足的断开时间
+    }
+    
     // 检查WiFi连接
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[BUTTON] WiFi未连接，无法开始语音对话");
@@ -285,19 +285,12 @@ void handleButtonPress() {
         return;
     }
     
-    // 检查语音服务是否已初始化
-    if (useRealtimeASR) {
+    // 检查实时识别服务是否已初始化
+    if (!realtimeASRInitialized) {
+        Serial.println("[BUTTON] 实时识别服务未初始化，尝试重新初始化...");
+        setupRealtimeASR();
         if (!realtimeASRInitialized) {
-            Serial.println("[BUTTON] 实时识别服务未初始化，尝试重新初始化...");
-            setupRealtimeASR();
-            if (!realtimeASRInitialized) {
-                Serial.println("[BUTTON] 实时识别仍未就绪，临时回退到RAW识别模式");
-                useRealtimeASR = false;
-            }
-        }
-    } else {
-        if (!speechInitialized) {
-            Serial.println("[BUTTON] 语音服务未初始化");
+            Serial.println("[BUTTON] 实时识别仍未就绪");
             // LED快速闪烁2次
             for (int i = 0; i < 2; i++) {
                 digitalWrite(LED_PIN, HIGH);
@@ -313,14 +306,9 @@ void handleButtonPress() {
     digitalWrite(LED_PIN, HIGH);
     Serial.println("[LED] 录音开始，LED常亮");
     
-    // 开始录音
+    // 开始实时录音
     Serial.println("[BUTTON] 开始录音，请说话...");
-    if (useRealtimeASR && realtimeASRInitialized) {
-        startRealtimeRecording();  // 实时识别
-    } else {
-        // 使用RAW识别方式
-        startVoiceRecording();
-    }
+    startRealtimeRecording();
 }
 
 void handleButtonRelease() {
@@ -335,12 +323,7 @@ void handleButtonRelease() {
         Serial.printf("[BUTTON] 实际录音时长: %lu ms\n", recordingDuration);
         
         Serial.println("[BUTTON] 停止录音并开始处理语音...");
-        
-        if (useRealtimeASR) {
-            stopRealtimeRecording();  // 实时识别
-        } else {
-            stopVoiceRecording();     // 传统方式
-        }
+        stopRealtimeRecording();
     } else {
         Serial.println("[BUTTON] 当前未在录音，忽略松开事件");
     }
@@ -349,9 +332,9 @@ void handleButtonRelease() {
 void startVoiceConversation() {
     Serial.println("\n=== 语音对话开始 ===");
     
-    // 检查语音服务是否已初始化
-    if (!speechInitialized) {
-        Serial.println("[VOICE] 语音服务未初始化，无法开始录音");
+    // 检查实时识别服务是否已初始化
+    if (!realtimeASRInitialized) {
+        Serial.println("[VOICE] 实时识别服务未初始化，无法开始录音");
         // LED快速闪烁表示错误
         for (int i = 0; i < 5; i++) {
             digitalWrite(LED_PIN, HIGH);
@@ -362,9 +345,9 @@ void startVoiceConversation() {
         return;
     }
     
-    // 开始真实的语音录音
+    // 开始实时录音
     Serial.println("[VOICE] 开始录音...");
-    startVoiceRecording();
+    startRealtimeRecording();
     
     Serial.println("=== 等待用户松开按钮停止录音 ===\n");
 }
@@ -701,7 +684,7 @@ String chatWithDeepSeek(const String& message) {
     jsonBody += "{\"role\":\"system\",\"content\":\"你是一个有用的AI助手。请简洁回答。\"},";
     jsonBody += "{\"role\":\"user\",\"content\":\"" + message + "\"}";
     jsonBody += "],";
-    jsonBody += "\"max_tokens\":50,";
+    jsonBody += "\"max_tokens\":300,";  // 增加到300 tokens，约600字，足够完整回答
     jsonBody += "\"stream\":false";
     jsonBody += "}";
     
@@ -802,8 +785,8 @@ String chatWithDeepSeek(const String& message) {
         String preview = responseBody.substring(0, min(200, (int)responseBody.length()));
         Serial.printf("[DeepSeek] 响应预览: %s...\n", preview.c_str());
         
-        // 解析JSON响应
-        DynamicJsonDocument doc(4096);
+        // 解析JSON响应 - 增加缓冲区到8KB以支持更长的回复
+        DynamicJsonDocument doc(8192);  // 从4KB增加到8KB
         DeserializationError error = deserializeJson(doc, responseBody);
         
         if (!error) {
@@ -951,17 +934,6 @@ void setupAudio() {
     }
     
     Serial.println("[AUDIO] ✓ I2S音频接口初始化成功");
-    
-    // 分配音频缓冲区（2秒录音，RAW格式无需Base64，大幅节省内存）
-    // 2秒 * 16000 Hz * 2字节 = 64KB (RAW格式直接上传，无需额外33%编码开销)
-    audioBufferSize = SAMPLE_RATE * 2 * 2; // 2秒的16位音频 = 64KB
-    audioBuffer = (uint8_t*)malloc(audioBufferSize);
-    if (!audioBuffer) {
-        Serial.println("[AUDIO] ✗ 音频缓冲区分配失败");
-        return;
-    }
-    
-    Serial.printf("[AUDIO] 音频缓冲区: %d bytes (%.1f KB) - RAW格式优化\n", audioBufferSize, audioBufferSize / 1024.0);
     Serial.printf("[AUDIO] 可用内存: %d bytes (%.1f KB)\n", ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
 }
 
@@ -1268,8 +1240,9 @@ void stopRealtimeRecording() {
         delay(10);
     }
     
-    // 断开连接
+    // 断开连接（添加延迟确保完全断开）
     realtimeASR.disconnect();
+    delay(100);  // 确保WebSocket完全断开
     
     unsigned long duration = millis() - recordingStartTime;
     Serial.printf("[REALTIME] 录音时长: %lu ms\n", duration);
@@ -1328,202 +1301,6 @@ void stopRealtimeRecording() {
     recordingStartTime = 0;
     
     Serial.println("[REALTIME] 对话流程完成，系统就绪");
-}
-
-void startVoiceRecording() {
-    Serial.println("[RECORD] 进入startVoiceRecording函数");
-    
-    if (!speechInitialized) {
-        Serial.println("[RECORD] ✗ 语音服务未初始化");
-        // LED快速闪烁表示服务未就绪
-        for (int i = 0; i < 3; i++) {
-            digitalWrite(LED_PIN, HIGH);
-            delay(100);
-            digitalWrite(LED_PIN, LOW);
-            delay(100);
-        }
-        return;
-    }
-    
-    if (isRecording) {
-        Serial.println("[RECORD] ✗ 已在录音中");
-        return;
-    }
-    
-    // 检查音频缓冲区
-    if (audioBuffer == nullptr) {
-        Serial.println("[RECORD] ✗ 音频缓冲区未初始化！");
-        Serial.println("[RECORD] 尝试重新初始化音频系统...");
-        setupAudio();
-        
-        if (audioBuffer == nullptr) {
-            Serial.println("[RECORD] ✗ 音频缓冲区重新初始化失败！");
-            // LED快速闪烁表示错误
-            for (int i = 0; i < 5; i++) {
-                digitalWrite(LED_PIN, HIGH);
-                delay(80);
-                digitalWrite(LED_PIN, LOW);
-                delay(80);
-            }
-            return;
-        } else {
-            Serial.println("[RECORD] ✓ 音频缓冲区重新初始化成功");
-        }
-    }
-    
-    Serial.println("[RECORD] 开始语音录制...");
-    isRecording = true;
-    recordedSize = 0;
-    recordingStartTime = millis();  // 正确初始化录音开始时间
-    
-    Serial.printf("[RECORD] 录音开始时间戳: %lu ms\n", recordingStartTime);
-    Serial.printf("[RECORD] 当前millis(): %lu ms\n", millis());
-    Serial.printf("[RECORD] 音频缓冲区: %p, 大小: %d bytes\n", audioBuffer, audioBufferSize);
-    
-    // 清空音频缓冲区
-    memset(audioBuffer, 0, audioBufferSize);
-    Serial.printf("[RECORD] 已清空音频缓冲区: %d bytes\n", audioBufferSize);
-    
-    // 清空I2S缓冲区
-    i2s_zero_dma_buffer(I2S_NUM_0);
-    
-    // 跳过开头的一些数据（可能包含噪音）
-    size_t bytes_read = 0;
-    int32_t temp_buffer[512]; // 增加缓冲区大小
-    // 跳过更多开头数据以确保稳定
-    for (int i = 0; i < 5; i++) {
-        esp_err_t result = i2s_read(I2S_NUM_0, temp_buffer, sizeof(temp_buffer), &bytes_read, 200);
-        Serial.printf("[RECORD] 跳过噪音数据 %d: %d bytes, 结果: %d\n", i+1, bytes_read, result);
-    }
-    
-    // LED指示录音状态 - 点亮LED表示正在录音
-    digitalWrite(LED_PIN, HIGH);
-    Serial.println("[RECORD] ✓ LED已点亮，表示正在录音");
-    
-    Serial.println("[RECORD] ✓ 录音开始，请说话...");
-    Serial.println("[RECORD] 松开按钮停止录音");
-    Serial.println("[RECORD] 💡 建议录音时间1-3秒以获得最佳识别效果");
-    Serial.println("[RECORD] 🎤 请对着麦克风大声清晰地说话，距离10-20cm");
-}
-
-void stopVoiceRecording() {
-    if (!isRecording) {
-        Serial.println("[RECORD] 当前未在录音");
-        return;
-    }
-    
-    // 计算录音时长
-    unsigned long recordingDuration = 0;
-    if (recordingStartTime > 0) {
-        recordingDuration = millis() - recordingStartTime;
-        Serial.printf("[RECORD] 录音时长: %lu 毫秒 (%.1f秒)\n", recordingDuration, recordingDuration / 1000.0);
-    } else {
-        Serial.println("[RECORD] ⚠️ 录音开始时间异常");
-    }
-    
-    isRecording = false;
-    recordingStartTime = 0;  // 重置录音开始时间
-    digitalWrite(LED_PIN, LOW);
-    
-    Serial.println("[RECORD] 录音停止");
-    Serial.printf("[RECORD] 录制音频大小: %d bytes\n", recordedSize);
-    
-    if (recordedSize > 0) {
-        processVoiceInput();
-    } else {
-        Serial.println("[RECORD] ⚠️ 没有录制到音频数据，可能原因：");
-        Serial.println("    1. 麦克风连接问题");
-        Serial.println("    2. I2S配置问题");
-        Serial.println("    3. 录音时间太短");
-        Serial.println("    4. 音频缓冲区问题");
-    }
-}
-
-void processVoiceInput() {
-    if (!speechInitialized || recordedSize == 0) {
-        Serial.println("[PROCESS] 无法处理语音输入");
-        return;
-    }
-    
-    Serial.printf("[PROCESS] 开始语音识别...（音频大小: %d bytes）\n", recordedSize);
-    Serial.printf("[PROCESS] 当前可用内存: %d bytes (%.1f KB)\n", ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
-    
-    // 检查音频数据最小要求（至少0.5秒的音频）
-    size_t minAudioSize = SAMPLE_RATE * 1; // 0.5秒的16位音频
-    if (recordedSize < minAudioSize) {
-        Serial.printf("[PROCESS] ⚠️ 音频较短（%d bytes < %d bytes），但尝试继续识别\n", recordedSize, minAudioSize);
-    }
-    
-    // 验证音频缓冲区指针
-    if (recordBuffer == nullptr || audioBuffer == nullptr) {
-        Serial.println("[PROCESS] ✗ 音频缓冲区指针无效");
-        return;
-    }
-    
-    // 检查音频数据是否有效
-    Serial.println("[PROCESS] 验证音频数据...");
-    bool hasNonZeroData = false;
-    uint32_t sum = 0;
-    uint16_t maxLevel = 0;
-    uint16_t* samples = (uint16_t*)recordBuffer;
-    size_t sampleCount = recordedSize / 2;
-    
-    for (size_t i = 0; i < sampleCount; i++) {
-        uint16_t level = abs((int16_t)samples[i]);
-        if (samples[i] != 0) {
-            hasNonZeroData = true;
-        }
-        sum += level;
-        if (level > maxLevel) maxLevel = level;
-    }
-    
-    uint16_t avgLevel = sampleCount > 0 ? sum / sampleCount : 0;
-    Serial.printf("[PROCESS] 音频统计 - 平均电平: %d, 最大电平: %d\n", avgLevel, maxLevel);
-    
-    // 音频质量评估
-    if (maxLevel < 50) {
-        Serial.println("[PROCESS] ⚠️ 音频电平较低，建议靠近麦克风说话");
-    } else if (maxLevel > 20000) {
-        Serial.println("[PROCESS] ⚠️ 音频电平过高，可能失真");
-    } else {
-        Serial.println("[PROCESS] ✓ 音频电平正常");
-    }
-    
-    if (!hasNonZeroData) {
-        Serial.println("[PROCESS] ✗ 音频数据全为零，麦克风或I2S配置问题");
-        return;
-    }
-    
-    // 使用RAW格式直接上传，无需Base64编码，大幅节省内存
-    Serial.println("[PROCESS] 使用RAW格式识别（无Base64编码，节省33%内存）...");
-    String recognizedText = baiduSpeech.recognizeSpeechRaw((uint8_t*)recordBuffer, recordedSize, SAMPLE_RATE);
-    
-    if (recognizedText.length() > 0) {
-        Serial.printf("[PROCESS] ✓ 识别结果: '%s'\n", recognizedText.c_str());
-        
-        // 检查识别结果是否过短
-        if (recognizedText.length() <= 2) {
-            Serial.println("[PROCESS] ⚠️ 识别结果较短，可能不完整，建议：");
-            Serial.println("    1. 录音时间适当延长到2-3秒");
-            Serial.println("    2. 说话更清晰，语速适中");
-            Serial.println("    3. 确保环境安静，减少背景噪音");
-        }
-        
-        // 与AI对话
-        Serial.println("[PROCESS] 发送给AI...");
-        String aiResponse = chatWithDeepSeek(recognizedText);
-        
-        Serial.printf("[PROCESS] AI回复: %s\n", aiResponse.c_str());
-        
-        // 流式文本转语音并直接I2S播放
-        Serial.println("[PROCESS] 流式合成并播放AI回复...");
-        speakTextStream(aiResponse);
-    } else {
-        Serial.printf("[PROCESS] 语音识别失败: %s\n", baiduSpeech.getLastError().c_str());
-    }
-    
-    // 清空录音缓冲区
-    recordedSize = 0;
 }
 
 void playTTSAudio(uint8_t* audioData, size_t audioSize) {
@@ -2079,7 +1856,7 @@ void loop() {
                 setupBaiduSpeech();
             }
             
-            if (!realtimeASRInitialized && useRealtimeASR) {
+            if (!realtimeASRInitialized) {
                 Serial.println("[REALTIME-ASR] ⟳ 重新尝试初始化实时识别...");
                 setupRealtimeASR();
             }
@@ -2094,8 +1871,8 @@ void loop() {
     // 检查按钮状态（高频率检查以确保响应性）
     checkButton();
     
-    // WebSocket循环处理（实时识别模式）- 必须在音频处理之前
-    if (useRealtimeASR && realtimeASRInitialized) {
+    // WebSocket循环处理（实时识别模式）
+    if (realtimeASRInitialized) {
         realtimeASR.loop();
     }
     
@@ -2113,12 +1890,8 @@ void loop() {
                 Serial.printf("[RECORD] 录音时长: %lu 毫秒 (%.1f秒)\n", recordingDuration, recordingDuration / 1000.0);
                 Serial.printf("[RECORD] 最大录音时间: %d ms\n", MAX_RECORD_TIME);
                 
-                // 根据模式调用正确的停止函数
-                if (useRealtimeASR) {
-                    stopRealtimeRecording();
-                } else {
-                    stopVoiceRecording();
-                }
+                // 停止实时录音
+                stopRealtimeRecording();
             }
         } else {
             // 时间异常，可能是刚刚开始录音
@@ -2263,10 +2036,10 @@ void loop() {
             } else if (command == "httptest") {
                 testSimpleHTTP();
             } else if (command == "record") {
-                startVoiceRecording();
+                startRealtimeRecording();
             } else if (command == "stop") {
                 if (isRecording) {
-                    stopVoiceRecording();
+                    stopRealtimeRecording();
                 } else {
                     Serial.println("当前未在录音");
                 }
@@ -2357,134 +2130,48 @@ void loop() {
         }
     }
     
-    // 处理语音录制
-    if (isRecording && audioBuffer) {
+    // 处理实时录音（实时传输音频数据）
+    if (isRecording) {
         size_t bytes_read = 0;
         int32_t i2s_buffer[512];  // 32位I2S缓冲区，512样本×4字节=2048字节
         
         esp_err_t result = i2s_read(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytes_read, 100);
         
-        // 定期输出I2S读取状态
-        static unsigned long lastI2SDebug = 0;
-        static int i2sReadCount = 0;
-        static int i2sSuccessCount = 0;
-        i2sReadCount++;
-        
-        if (millis() - lastI2SDebug > 2000) {
-            Serial.printf("[I2S-DEBUG] 读取次数: %d, 成功: %d, 最后结果: %d, 字节: %d\n", 
-                          i2sReadCount, i2sSuccessCount, result, bytes_read);
-            
-            // 输出原始32位数据样本
-            if (bytes_read > 0) {
-                Serial.print("[I2S-DEBUG] 原始32位样本值: ");
-                for (int i = 0; i < 5 && i < bytes_read/4; i++) {
-                    Serial.printf("%d(0x%08X) ", i2s_buffer[i], i2s_buffer[i]);
-                }
-                Serial.println();
-            }
-            
-            lastI2SDebug = millis();
-            i2sReadCount = 0;
-            i2sSuccessCount = 0;
-        }
-        
         if (result == ESP_OK && bytes_read > 0) {
-            i2sSuccessCount++;
-            
             // 转换32位数据到16位
             size_t samples_read = bytes_read / 4;  // 32位 = 4字节
+            uint8_t pcm_buffer[samples_read * 2];  // 16位 = 2字节
+            int16_t* output_ptr = (int16_t*)pcm_buffer;
             
-            if (useRealtimeASR) {
-                // 实时识别模式
-                uint8_t pcm_buffer[samples_read * 2];  // 16位 = 2字节
-                int16_t* output_ptr = (int16_t*)pcm_buffer;
+            for (size_t i = 0; i < samples_read; i++) {
+                // INMP441的数据在32位的高18位，右移14位得到16位数据
+                output_ptr[i] = (int16_t)(i2s_buffer[i] >> 14);
+            }
+            
+            // 检查WebSocket是否已连接并发送音频数据
+            if (realtimeASR.isConnected()) {
+                realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
+                recordedSize += samples_read * 2;  // 记录已发送大小
                 
-                for (size_t i = 0; i < samples_read; i++) {
-                    // INMP441的数据在32位的高18位，右移14位得到16位数据
-                    output_ptr[i] = (int16_t)(i2s_buffer[i] >> 14);
-                }
-                
-                // 检查WebSocket是否已连接
-                if (realtimeASR.isConnected()) {
-                    // WebSocket已连接，直接发送音频数据
-                    bool sendResult = realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
+                // 定期输出调试信息
+                static unsigned long lastDebugTime = 0;
+                if (millis() - lastDebugTime > 1000) {
+                    Serial.printf("[REALTIME] 已发送 %d bytes 音频数据\n", recordedSize);
                     
-                    // 定期输出调试信息
-                    static unsigned long lastDebugTime = 0;
-                    static int sendCount = 0;
-                    static size_t totalSent = 0;
-                    
-                    if (sendResult) {
-                        sendCount++;
-                        totalSent += samples_read * 2;
+                    // 检查音频电平
+                    uint32_t sum = 0;
+                    uint16_t maxLevel = 0;
+                    for (size_t i = 0; i < samples_read && i < 512; i++) {
+                        uint16_t level = abs(output_ptr[i]);
+                        sum += level;
+                        if (level > maxLevel) maxLevel = level;
+                    }
+                    if (samples_read > 0) {
+                        Serial.printf("[REALTIME] 音频电平 - 平均: %d, 最大: %d\n", 
+                                      sum / samples_read, maxLevel);
                     }
                     
-                    if (millis() - lastDebugTime > 1000) {
-                        Serial.printf("[REALTIME-DEBUG] 已发送 %d 次音频数据，总计 %d bytes\n", 
-                                      sendCount, totalSent);
-                        
-                        // 检查音频电平
-                        uint32_t sum = 0;
-                        uint16_t maxLevel = 0;
-                        for (size_t i = 0; i < samples_read && i < 512; i++) {
-                            uint16_t level = abs(output_ptr[i]);
-                            sum += level;
-                            if (level > maxLevel) maxLevel = level;
-                        }
-                        if (samples_read > 0) {
-                            Serial.printf("[REALTIME-DEBUG] 音频电平 - 平均: %d, 最大: %d\n", 
-                                          sum / samples_read, maxLevel);
-                        }
-                        
-                        lastDebugTime = millis();
-                        sendCount = 0;
-                        totalSent = 0;
-                    }
-                } else {
-                    // WebSocket未连接，先缓存到audioBuffer（等连接后发送）
-                    if (recordedSize < audioBufferSize - 2048) {
-                        memcpy(audioBuffer + recordedSize, pcm_buffer, samples_read * 2);
-                        recordedSize += samples_read * 2;
-                        
-                        static unsigned long lastBufferInfo = 0;
-                        if (millis() - lastBufferInfo > 500) {
-                            Serial.printf("[REALTIME] WebSocket连接中，已缓存 %d bytes 音频\n", recordedSize);
-                            lastBufferInfo = millis();
-                        }
-                    }
-                }
-                
-            } else {
-                // 传统模式：缓存所有音频
-                if (recordedSize < audioBufferSize - 2048) {
-                    int16_t* output_ptr = (int16_t*)(audioBuffer + recordedSize);
-                    
-                    for (size_t i = 0; i < samples_read; i++) {
-                        output_ptr[i] = (int16_t)(i2s_buffer[i] >> 14);
-                    }
-                    
-                    recordedSize += samples_read * 2;
-                    recordBuffer = audioBuffer; // 指向录音数据
-                    
-                    // 计算音频电平（检查转换后的16位数据）
-                    static unsigned long lastLevelCheck = 0;
-                    if (millis() - lastLevelCheck > 500) { // 每500ms检查一次
-                        uint32_t sum = 0;
-                        uint16_t maxLevel = 0;
-                        
-                        for (size_t i = 0; i < samples_read; i++) {
-                            uint16_t level = abs(output_ptr[i]);
-                            sum += level;
-                            if (level > maxLevel) maxLevel = level;
-                        }
-                        
-                        if (samples_read > 0) {
-                            uint16_t avgLevel = sum / samples_read;
-                            Serial.printf("[RECORD] 电平 - 平均: %d, 最大: %d, 已录制: %d bytes\n", 
-                                        avgLevel, maxLevel, recordedSize);
-                        }
-                        lastLevelCheck = millis();
-                    }
+                    lastDebugTime = millis();
                 }
             }
         }
