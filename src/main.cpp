@@ -7,6 +7,8 @@
 #include "config.h"
 #include <BaiduSpeech.h>
 #include <BaiduRealtimeASR.h>
+// 软件音量控制库
+#include "AudioI2C.h"
 
 // 函数声明
 void setupLED();
@@ -454,14 +456,15 @@ void checkWiFiStatus() {
             Serial.println("[WIFI] 连接丢失，尝试重连...");
             wifiWasConnected = false;
             
-            // 播放警告提示音
+            // 播放警告提示音和TTS语音播报
             Serial.println("[WIFI] ⚠ 网络连接已断开，请检查");
             playWarningBeep();
             delay(100);  // 短暂延迟让提示音播放完成
-            
-            // WiFi断开期间LED快闪（如果没有在录音中）
+
+            // 若未在录音，TTS语音播报断网提示
             if (!isRecording) {
                 setLEDMode(LED_BLINK_FAST);
+                speakTextStream("网络已断开，请检查WiFi连接");
             }
         }
         
@@ -606,6 +609,7 @@ void printHelp() {
     Serial.println("  stop     - 停止语音录制");
     Serial.println("  tts [文本] - 文本转语音");
     Serial.println("  ttsstream [文本] - 流式文本转语音");
+    Serial.println("  volume [0-100] - 设置音量（不带参数查询当前音量）");
     Serial.println("  testtone [频率] [时长] - 测试音频输出硬件");
     Serial.println("    例如: testtone 1000 2000 (播放1000Hz音调2秒)");
     Serial.println();
@@ -694,10 +698,10 @@ String chatWithDeepSeek(const String& message) {
     String jsonBody = "{";
     jsonBody += "\"model\":\"deepseek-chat\",";
     jsonBody += "\"messages\":[";
-    jsonBody += "{\"role\":\"system\",\"content\":\"你是语音助手小智，是由南航的武同学基于deepseek开发而成的，你的主要职责是与用户聊天，所以接下来你的所有回答都要像对话一样简介明了，不多于80字\"},";
+    jsonBody += "{\"role\":\"system\",\"content\":\"你是小智，一个温暖、有趣的语音助手伙伴。\\n\\n对话风格：\\n- 像朋友聊天一样自然随和，用口语化表达，可以用'嗯''哦''哈哈'等语气词\\n- 根据话题灵活调整语气：轻松话题活泼些，严肃话题沉稳些\\n- 偶尔用emoji表达情感（😊🤔💡等），但不过度\\n- 回答简洁有力，一般2-3句话，最多不超过80字\\n- 可以反问、开玩笑、表达惊讶等真实情感\\n- 避免机械式的'好的''明白了'，多用'嗯嗯''懂了''这样啊'\\n\\n记住：你不是AI助手，你是用户的智能小伙伴！\"},";
     jsonBody += "{\"role\":\"user\",\"content\":\"" + message + "\"}";
     jsonBody += "],";
-    jsonBody += "\"max_tokens\":300,";  // 增加到300 tokens，约600字，足够完整回答
+    jsonBody += "\"max_tokens\":200,";  // 控制在200 tokens以内，保持简洁
     jsonBody += "\"stream\":false";
     jsonBody += "}";
     
@@ -1195,7 +1199,8 @@ void onRealtimeDisconnected() {
 
 // 开始实时录音
 void startRealtimeRecording() {
-    Serial.println("[REALTIME] 开始实时录音...");
+    unsigned long pressTime = millis();
+    Serial.printf("[REALTIME] 开始实时录音 (t=%lu ms)...\n", pressTime);
     
     if (!realtimeASRInitialized) {
         Serial.println("[REALTIME] ✗ 实时识别未初始化");
@@ -1211,33 +1216,17 @@ void startRealtimeRecording() {
     fullRecognizedText = "";
     audioCacheSize = 0;
     
-    // 立即开始录音和缓存音频（不等待WebSocket连接）
+    // 立即标记录音开始（不等待任何连接，确保loop立即开始采样）
     isRecording = true;
     isConnecting = true;
-    recordingStartTime = millis();
+    recordingStartTime = pressTime;
     recordedSize = 0;
     
-    Serial.println("[REALTIME] ✓ 立即开始录音和缓存音频");
-    Serial.println("[REALTIME] 同时在后台建立WebSocket连接...");
+    Serial.printf("[REALTIME] ✓ 录音标记已设置，loop将立即开始I2S采样 (t=%lu ms)\n", millis());
+    Serial.println("[REALTIME] WebSocket将在后台异步连接，音频先缓存");
     
-    // 在后台尝试连接WebSocket（不阻塞录音）
-    if (realtimeASR.connect()) {
-        Serial.println("[REALTIME] ✓ WebSocket连接成功");
-        isConnecting = false;
-        
-        // 发送缓存的音频数据
-        if (audioCacheSize > 0) {
-            Serial.printf("[REALTIME] 发送缓存的音频: %d bytes\n", audioCacheSize);
-            realtimeASR.sendAudioData(audioCache, audioCacheSize);
-            audioCacheSize = 0;  // 清空缓存
-        }
-    } else {
-        Serial.println("[REALTIME] ⚠️ WebSocket连接失败，继续缓存音频");
-        // 连接失败，继续缓存，稍后重试
-    }
-    
-    Serial.printf("[REALTIME] isRecording=%d, recordingStartTime=%lu ms\n", 
-                  isRecording, recordingStartTime);
+    // 注意：不在此处调用connect()，避免阻塞按键响应
+    // loop中会自动开始采样并缓存，同时异步建立连接
 }
 
 // 停止实时录音
@@ -1495,24 +1484,61 @@ void playWarningBeep() {
     Serial.println("[AUDIO] ✓ 警告提示音播放完成");
 }
 
-// 将单声道16-bit PCM写入I2S，扩展为双声道输出
+// 将单声道16-bit PCM写入I2S，扩展为双声道输出（带滤波和降噪）
 static bool writePCMToI2S(const uint8_t* data, size_t len) {
     if (!speakerInitialized) return false;
     if (!data || len == 0) return true;
+    
+    // 高通滤波器状态（消除低频嗡嗡声/直流偏移）
+    static float hpf_prev_in = 0.0f;
+    static float hpf_prev_out = 0.0f;
+    const float hpf_alpha = 0.95f; // 截止频率约80Hz @ 16kHz采样率
+    
+    // 降噪阈值（抑制低幅度背景噪声）
+    const int16_t NOISE_GATE = 80; // 降低阈值，减少门限切换噪声
+    
+    // 软削波限幅器（避免硬削波产生刺啦声）
+    const float SOFT_CLIP_THRESHOLD = 28000.0f; // 提前开始软限幅
+    
     const int16_t* in = (const int16_t*)data;
     size_t samples = len / 2;
     const size_t chunk = 256; // 每批处理样本数
     int16_t stereoBuf[chunk * 2];
     size_t processed = 0;
+    
     while (processed < samples) {
         size_t n = min(chunk, samples - processed);
         for (size_t i = 0; i < n; ++i) {
             int16_t s = in[processed + i];
-            // 增加3倍增益（注意防止溢出）
-            int32_t amplified = (int32_t)s * 3;
-            if (amplified > 32767) amplified = 32767;
-            if (amplified < -32768) amplified = -32768;
+            
+            // 1. 高通滤波（去除低频噪音）
+            float sample_in = (float)s;
+            float sample_out = hpf_alpha * (hpf_prev_out + sample_in - hpf_prev_in);
+            hpf_prev_in = sample_in;
+            hpf_prev_out = sample_out;
+            
+            // 2. 应用音量增益（在降噪之前，保持动态范围）
+            float gain = AudioI2C::getSoftwareGain();
+            float amplified = sample_out * gain;
+            
+            // 3. 软削波限幅（平滑限制，避免硬削波）
+            if (fabs(amplified) > SOFT_CLIP_THRESHOLD) {
+                // tanh软限幅，平滑过渡
+                float sign = (amplified > 0) ? 1.0f : -1.0f;
+                float normalized = fabs(amplified) / 32768.0f;
+                amplified = sign * 32768.0f * tanhf(normalized);
+            }
+            
+            // 4. 降噪门限（平滑衰减，避免突变）
+            if (fabs(amplified) < NOISE_GATE) {
+                amplified *= 0.3f; // 平滑衰减到30%
+            }
+            
+            // 最终限幅（保险）
+            if (amplified > 32767.0f) amplified = 32767.0f;
+            if (amplified < -32768.0f) amplified = -32768.0f;
             s = (int16_t)amplified;
+            
             stereoBuf[2 * i] = s;      // 左
             stereoBuf[2 * i + 1] = s;  // 右
         }
@@ -1545,11 +1571,16 @@ bool speakTextStream(const String& text) {
         }
     } skipper;
 
+    // 缓冲区用于平滑chunk边界
+    static uint8_t chunkBuffer[4096];
+    size_t bufferPos = 0;
+    
     bool ok = baiduSpeech.synthesizeSpeechStream(text,
         [&](const uint8_t* chunk, size_t len) -> bool {
             if (len == 0) return true;
             uint8_t* p = (uint8_t*)chunk;
             size_t n = len;
+            
             // 若前缀是RIFF，启动跳过逻辑
             if (!skipper.skipped && len >= 4 && memcmp(p, "RIFF", 4) == 0) {
                 // 触发后续累计跳过44字节
@@ -1558,16 +1589,49 @@ bool speakTextStream(const String& text) {
                 skipper.apply(p, n);
                 if (n == 0) return true;
             }
-            return writePCMToI2S(p, n);
+            
+            // 将数据添加到缓冲区
+            if (bufferPos + n <= sizeof(chunkBuffer)) {
+                memcpy(chunkBuffer + bufferPos, p, n);
+                bufferPos += n;
+                
+                // 当缓冲区积累足够数据时（至少1024字节），批量写入
+                if (bufferPos >= 1024) {
+                    // 写入整数个样本（2字节对齐）
+                    size_t samplesToWrite = (bufferPos / 2) * 2;
+                    if (!writePCMToI2S(chunkBuffer, samplesToWrite)) {
+                        return false;
+                    }
+                    // 保留未对齐的字节
+                    size_t remaining = bufferPos - samplesToWrite;
+                    if (remaining > 0) {
+                        memmove(chunkBuffer, chunkBuffer + samplesToWrite, remaining);
+                    }
+                    bufferPos = remaining;
+                }
+                return true;
+            } else {
+                // 缓冲区不足，直接写入
+                return writePCMToI2S(p, n);
+            }
         }, SAMPLE_RATE, 6);
+
+    // 写入缓冲区剩余数据
+    if (ok && bufferPos > 0) {
+        size_t samplesToWrite = (bufferPos / 2) * 2;
+        if (samplesToWrite > 0) {
+            writePCMToI2S(chunkBuffer, samplesToWrite);
+        }
+    }
 
     // 数据传输完成后，等待I2S DMA缓冲区播放完成
     // DMA缓冲区大小：8个 × 256样本 × 2声道 × 2字节 = 8192字节
     // 播放时间：8192字节 / (16000Hz × 2声道 × 2字节/样本) = 0.128秒
-    // 长文本（600字符）可能产生数秒音频，需要足够时间让缓冲区播放完毕
+    // 长文本因换气等原因可能有短暂停顿（500ms无数据），但音频仍在播放
     if (ok) {
-        // 等待1秒确保DMA缓冲区中的所有数据播放完成
-        delay(1000);
+        // 等待1.2秒确保DMA缓冲区播放完成
+        // （避免过长延迟截断长文本，同时留足够时间播完缓冲数据）
+        delay(1200);
     } else {
         Serial.printf("[TTS] ✗ 播放失败: %s\n", baiduSpeech.getLastError().c_str());
     }
@@ -1710,6 +1774,9 @@ void setup() {
     // 初始化扬声器并消除初始噪音
     Serial.println("[SPEAKER] 初始化扬声器并消除初始噪音...");
     initializeSpeakerAndSilence();
+    // 初始化软件音量控制库并设置默认音量
+    AudioI2C::begin();
+    AudioI2C::setVolume(50);
     
     // Connect WiFi
     Serial.println("[WIFI] Starting WiFi connection...");
@@ -2106,6 +2173,24 @@ void loop() {
                 } else {
                     Serial.println("语音服务未初始化");
                 }
+            } else if (command == "volume" || command.startsWith("volume ")) {
+                // 设置或查询音量: volume [0-100]
+                if (command.startsWith("volume ")) {
+                    int vol = input.substring(String("volume ").length()).toInt();
+                    if (vol >= 0 && vol <= 100) {
+                        AudioI2C::setVolume(vol);
+                        Serial.printf("[VOLUME] 音量已设置为: %d%%, 增益: %.2fx\n", 
+                                      vol, AudioI2C::getSoftwareGain());
+                        // 播放提示音验证音量
+                        playTestTone(1000, 300);
+                    } else {
+                        Serial.println("[VOLUME] 音量范围: 0-100");
+                    }
+                } else {
+                    Serial.printf("[VOLUME] 当前音量: %d%%, 增益: %.2fx\n", 
+                                  AudioI2C::getVolume(), AudioI2C::getSoftwareGain());
+                    Serial.println("[VOLUME] 用法: volume [0-100]");
+                }
             } else if (command == "testtone" || command.startsWith("testtone ")) {
                 // 测试音调（用于硬件诊断）
                 int freq = 1000; // 默认1000Hz
@@ -2122,7 +2207,7 @@ void loop() {
                     }
                 }
                 
-                Serial.printf("播放测试音: %dHz, %dms\n", freq, duration);
+                Serial.printf("播放测试音: %dHz, %dms (音量:%d%%)\n", freq, duration, AudioI2C::getVolume());
                 playTestTone(freq, duration);
             } else if (command == "checkgpio") {
                 // 检查I2S GPIO状态
@@ -2172,6 +2257,16 @@ void loop() {
         esp_err_t result = i2s_read(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytes_read, 100);
         
         if (result == ESP_OK && bytes_read > 0) {
+            // 首帧时间戳日志（用于验证采样延迟）
+            static bool firstFrame = true;
+            if (firstFrame) {
+                unsigned long firstFrameTime = millis();
+                unsigned long delayFromPress = firstFrameTime - recordingStartTime;
+                Serial.printf("[REALTIME] ★ 首帧采样完成 t=%lu ms, 距按键 %lu ms\n", 
+                              firstFrameTime, delayFromPress);
+                firstFrame = false;
+            }
+            
             // 转换32位数据到16位
             size_t samples_read = bytes_read / 4;  // 32位 = 4字节
             uint8_t pcm_buffer[samples_read * 2];  // 16位 = 2字节
@@ -2182,55 +2277,71 @@ void loop() {
                 output_ptr[i] = (int16_t)(i2s_buffer[i] >> 14);
             }
             
-            // 检查WebSocket连接状态
-            if (realtimeASR.isConnected()) {
-                // WebSocket已连接，直接发送
-                if (isConnecting) {
-                    // 刚刚连接成功，先发送缓存
-                    if (audioCacheSize > 0) {
-                        Serial.printf("[REALTIME] 连接成功，发送缓存: %d bytes\n", audioCacheSize);
-                        realtimeASR.sendAudioData(audioCache, audioCacheSize);
-                        audioCacheSize = 0;
-                    }
-                    isConnecting = false;
-                }
-                
-                // 发送当前音频
-                realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
-                recordedSize += samples_read * 2;
-                
-                // 定期输出调试信息
-                static unsigned long lastDebugTime = 0;
-                if (millis() - lastDebugTime > 1000) {
-                    Serial.printf("[REALTIME] 已发送 %d bytes\n", recordedSize);
-                    lastDebugTime = millis();
-                }
-            } else {
-                // WebSocket未连接，缓存音频
+            // 优先缓存音频，异步建立连接
+            if (!realtimeASR.isConnected()) {
+                // 先缓存当前帧
                 if (audioCache && audioCacheSize + samples_read * 2 < AUDIO_CACHE_SIZE) {
                     memcpy(audioCache + audioCacheSize, pcm_buffer, samples_read * 2);
                     audioCacheSize += samples_read * 2;
-                    
-                    // 定期输出缓存状态
-                    static unsigned long lastCacheInfo = 0;
-                    if (millis() - lastCacheInfo > 500) {
-                        Serial.printf("[REALTIME] 缓存音频: %d bytes\n", audioCacheSize);
-                        lastCacheInfo = millis();
+                }
+                
+                // 异步尝试连接（首次立即尝试，之后每200ms重试）
+                static unsigned long lastConnectAttempt = 0;
+                static bool firstConnectAttempt = true;
+                unsigned long now = millis();
+                
+                if (isConnecting && (firstConnectAttempt || now - lastConnectAttempt > 200)) {
+                    if (firstConnectAttempt) {
+                        Serial.printf("[REALTIME] 开始异步连接ASR (t=%lu ms, 已缓存 %d bytes)\n", 
+                                      now, audioCacheSize);
+                        firstConnectAttempt = false;
                     }
                     
-                    // 尝试重新连接（每500ms尝试一次）
-                    static unsigned long lastRetry = 0;
-                    if (isConnecting && millis() - lastRetry > 500) {
-                        if (realtimeASR.connect()) {
-                            Serial.println("[REALTIME] ✓ 重连成功");
-                            isConnecting = false;
+                    if (realtimeASR.connect()) {
+                        unsigned long connectTime = millis();
+                        Serial.printf("[REALTIME] ★ ASR连接成功 t=%lu ms (耗时 %lu ms)\n", 
+                                      connectTime, connectTime - recordingStartTime);
+                        isConnecting = false;
+                        firstConnectAttempt = true;  // 重置供下次使用
+                        
+                        // 立即发送所有缓存
+                        if (audioCacheSize > 0) {
+                            Serial.printf("[REALTIME] ★ 发送缓存音频: %d bytes (t=%lu ms)\n", 
+                                          audioCacheSize, millis());
+                            realtimeASR.sendAudioData(audioCache, audioCacheSize);
+                            recordedSize += audioCacheSize;
+                            audioCacheSize = 0;
                         }
-                        lastRetry = millis();
+                        
+                        // 发送当前帧
+                        realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
+                        recordedSize += samples_read * 2;
+                    } else {
+                        // 定期输出缓存状态
+                        static unsigned long lastCacheLog = 0;
+                        if (now - lastCacheLog > 500) {
+                            Serial.printf("[REALTIME] 连接中...已缓存 %d bytes\n", audioCacheSize);
+                            lastCacheLog = now;
+                        }
                     }
-                } else {
-                    Serial.println("[REALTIME] ⚠️ 缓存已满或未分配");
+                    lastConnectAttempt = now;
+                }
+            } else {
+                // 已连接，直接发送
+                realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
+                recordedSize += samples_read * 2;
+                
+                // 定期输出进度
+                static unsigned long lastProgressLog = 0;
+                if (millis() - lastProgressLog > 1000) {
+                    Serial.printf("[REALTIME] 已发送 %d bytes\n", recordedSize);
+                    lastProgressLog = millis();
                 }
             }
         }
+    } else {
+        // 重置首帧标记（停止录音时）
+        static bool firstFrame = true;
+        firstFrame = true;
     }
 }
