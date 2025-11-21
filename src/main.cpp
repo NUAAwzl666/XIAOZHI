@@ -25,6 +25,7 @@ void checkWiFiStatus();
 void showHeartbeat();
 void processSerialCommands();
 void initializeSpeakerAndSilence();
+void playWarningBeep();
 
 // AI功能函数
 void setupAI();
@@ -90,6 +91,9 @@ String fullRecognizedText = "";  // 存储完整识别结果
 
 // 系统初始化状态
 bool systemFullyInitialized = false;  // 标记系统是否完全初始化完成
+bool isInitializing = false;           // 标记是否正在初始化循环中
+unsigned long lastInitAttemptTime = 0; // 上次初始化尝试时间
+const unsigned long INIT_RETRY_INTERVAL = 3000; // 初始化重试间隔(3秒)
 
 // 扬声器输出状态
 static bool speakerInitialized = false;
@@ -453,6 +457,12 @@ void checkWiFiStatus() {
         if (wifiWasConnected) {
             Serial.println("[WIFI] 连接丢失，尝试重连...");
             wifiWasConnected = false;
+            
+            // 播放警告提示音
+            Serial.println("[WIFI] ⚠ 网络连接已断开，请检查");
+            playWarningBeep();
+            delay(100);  // 短暂延迟让提示音播放完成
+            
             // WiFi断开期间LED快闪（如果没有在录音中）
             if (!isRecording) {
                 setLEDMode(LED_BLINK_FAST);
@@ -462,23 +472,17 @@ void checkWiFiStatus() {
         // 尝试重连
         int attempts = 0;
         while (WiFi.status() != WL_CONNECTED && attempts < 5) {
-            Serial.printf("[WIFI] 重连尝试 %d/5...", attempts + 1);
+            Serial.printf("[WIFI] 重连尝试 %d/5...\n", attempts + 1);
             WiFi.disconnect();
-            // 在等待期间更新LED闪烁
-            for (int i = 0; i < 10; i++) {
-                updateLED();
-                delay(100);
-            }
+            delay(500);  // 稍等再开始连接
+            
             WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
             
-            // 等待连接，最多20秒
+            // 等待连接，最多10秒（每秒检查一次）
             int waitTime = 0;
-            while (WiFi.status() != WL_CONNECTED && waitTime < 20) {
-                // 等待期间保持LED快闪（若未在录音）
-                for (int i = 0; i < 10; i++) {
-                    updateLED();
-                    delay(100);
-                }
+            while (WiFi.status() != WL_CONNECTED && waitTime < 10) {
+                delay(1000);  // 每秒检查一次，避免频繁输出
+                updateLED();
                 Serial.print(".");
                 waitTime++;
             }
@@ -487,6 +491,16 @@ void checkWiFiStatus() {
                 Serial.println("\n[WIFI] ✓ 重连成功！");
                 Serial.printf("[WIFI] IP地址: %s\n", WiFi.localIP().toString().c_str());
                 wifiWasConnected = true;
+                
+                // WiFi重连成功，重置初始化状态，重新开始初始化循环
+                Serial.println("[SYSTEM] WiFi重连成功，重置初始化状态并重新开始初始化循环...");
+                aiInitialized = false;
+                speechInitialized = false;
+                realtimeASRInitialized = false;
+                systemFullyInitialized = false;
+                isInitializing = true;
+                lastInitAttemptTime = millis();
+                
                 // WiFi重连成功，若未在录音，LED熄灭
                 if (!isRecording) {
                     setLEDMode(LED_OFF);
@@ -495,6 +509,7 @@ void checkWiFiStatus() {
             } else {
                 Serial.println("\n[WIFI] ✗ 重连失败");
                 attempts++;
+                delay(1000);  // 重连失败后等待1秒再尝试
             }
         }
         
@@ -1620,6 +1635,65 @@ void initializeSpeakerAndSilence() {
     Serial.println("[SPK-INIT] ✓ 扬声器初始化完成，噪音已消除\n");
 }
 
+// 播放提示音（用于WiFi断开等无网络情况）
+void playWarningBeep() {
+    if (!speakerInitialized) return;
+    
+    Serial.println("[AUDIO] 播放警告提示音(3声蜂鸣)...");
+    
+    const int frequency = 800;  // 频率800Hz
+    const int duration_ms = 600;  // 每声持续600ms
+    const int beep_count = 3;  // 3声蜂鸣
+    const int pause_ms = 200;  // 间隔200ms
+    const int sample_rate = SAMPLE_RATE;
+    const int num_samples = (sample_rate * duration_ms) / 1000;
+    
+    int16_t* beepBuffer = (int16_t*)malloc(num_samples * 2 * sizeof(int16_t));
+    if (!beepBuffer) {
+        Serial.println("[AUDIO] ✗ 无法分配提示音缓冲区");
+        return;
+    }
+    
+    // 生成正弦波蜂鸣声
+    for (int i = 0; i < num_samples; i++) {
+        float t = (float)i / sample_rate;
+        float sample = sin(2.0 * PI * frequency * t) * 8000;  // 振幅8000
+        
+        // 添加淡入淡出效果
+        float envelope = 1.0;
+        if (i < num_samples / 10) {
+            envelope = (float)i / (num_samples / 10);
+        } else if (i > num_samples * 9 / 10) {
+            envelope = (float)(num_samples - i) / (num_samples / 10);
+        }
+        
+        int16_t value = (int16_t)(sample * envelope);
+        beepBuffer[i * 2] = value;      // 左声道
+        beepBuffer[i * 2 + 1] = value;  // 右声道
+    }
+    
+    // 播放3次蜂鸣声
+    for (int beep = 0; beep < beep_count; beep++) {
+        // 写入I2S
+        size_t bytesWritten = 0;
+        size_t totalBytes = num_samples * 2 * sizeof(int16_t);
+        esp_err_t err = i2s_write(I2S_NUM_1, beepBuffer, totalBytes, &bytesWritten, portMAX_DELAY);
+        
+        if (err != ESP_OK) {
+            Serial.printf("[AUDIO] ✗ 第%d声蜂鸣播放失败: %d\n", beep + 1, err);
+            break;
+        }
+        
+        // 蜂鸣声之间的间隔
+        if (beep < beep_count - 1) {
+            delay(pause_ms);
+        }
+    }
+    
+    free(beepBuffer);
+    Serial.println("[AUDIO] ✓ 警告提示音播放完成");
+}
+
 // 将单声道16-bit PCM写入I2S，扩展为双声道输出
 static bool writePCMToI2S(const uint8_t* data, size_t len) {
     if (!speakerInitialized) return false;
@@ -1877,45 +1951,11 @@ void setup() {
         // WiFi连接成功，LED熄灭
         setLEDMode(LED_OFF);
         
-        // 初始化AI服务
-        Serial.println("[AI] 开始AI服务初始化...");
-        setupAI();
-        
-        // 初始化语音服务
-        Serial.println("[SPEECH] 开始语音服务初始化...");
-        setupBaiduSpeech();
-        
-        // 初始化实时语音识别
-        if (useRealtimeASR) {
-            Serial.println("[REALTIME-ASR] 开始实时识别初始化...");
-            setupRealtimeASR();
-        }
-        
-        // 检查所有服务是否初始化成功
-        if (aiInitialized && speechInitialized && realtimeASRInitialized) {
-            systemFullyInitialized = true;
-            Serial.println("\n[SYSTEM] ✓ 所有服务初始化完成！");
-            
-            // 播放初始化完成提示音
-            delay(500);  // 稍等让系统稳定
-            Serial.println("[SYSTEM] 播放初始化完成提示...");
-            speakTextStream("初始化已完成，现在可以开始了");
-            
-            // LED快速闪烁5次表示系统就绪
-            for (int i = 0; i < 5; i++) {
-                digitalWrite(LED_PIN, HIGH);
-                delay(100);
-                digitalWrite(LED_PIN, LOW);
-                delay(100);
-            }
-        } else {
-            systemFullyInitialized = false;
-            Serial.println("\n[SYSTEM] ⚠ 部分服务初始化失败");
-            Serial.printf("[SYSTEM] AI: %s, Speech: %s, RealtimeASR: %s\n",
-                         aiInitialized ? "✓" : "✗",
-                         speechInitialized ? "✓" : "✗",
-                         realtimeASRInitialized ? "✓" : "✗");
-        }
+        // 启动初始化循环
+        Serial.println("[SYSTEM] 启动初始化循环...");
+        isInitializing = true;
+        systemFullyInitialized = false;
+        lastInitAttemptTime = millis();
         
     } else {
         Serial.println("\n[WIFI] ✗ WiFi connection failed!");
@@ -1952,6 +1992,98 @@ void loop() {
     
     // 更新LED状态（非阻塞），确保闪烁/常亮及时生效
     updateLED();
+    
+    // ==================== 初始化循环管理 ====================
+    // 如果正在初始化循环中，持续检查和重试
+    if (isInitializing && !systemFullyInitialized) {
+        // 先检查WiFi状态,如果断开则停止初始化
+        if (WiFi.status() != WL_CONNECTED) {
+            if (wifiWasConnected) {
+                Serial.println("[SYSTEM] ⚠ 初始化期间检测到WiFi断开,停止初始化循环");
+                isInitializing = false;
+                wifiWasConnected = false;
+                
+                // 播放警告提示音
+                Serial.println("[WIFI] ⚠ 网络连接已断开，请检查");
+                playWarningBeep();
+                
+                // LED快闪
+                if (!isRecording) {
+                    setLEDMode(LED_BLINK_FAST);
+                }
+            }
+            return;  // 跳过本次循环
+        }
+        
+        // 检查当前初始化状态
+        bool allServicesInitialized = aiInitialized && speechInitialized && realtimeASRInitialized;
+        
+        if (allServicesInitialized) {
+            // 所有服务初始化成功！
+            systemFullyInitialized = true;
+            isInitializing = false;
+            
+            Serial.println("\n[SYSTEM] ══════════════════════════════════════");
+            Serial.println("[SYSTEM] ✓ 所有服务初始化完成！");
+            Serial.println("[SYSTEM] ══════════════════════════════════════");
+            Serial.printf("[SYSTEM] AI服务: ✓\n");
+            Serial.printf("[SYSTEM] 语音服务: ✓\n");
+            Serial.printf("[SYSTEM] 实时识别: ✓\n");
+            Serial.println("[SYSTEM] ══════════════════════════════════════\n");
+            
+            // 播放初始化完成提示音
+            delay(500);  // 稍等让系统稳定
+            Serial.println("[SYSTEM] 🔊 播放初始化完成提示...");
+            speakTextStream("初始化已完成，现在可以开始了");
+            
+            // LED快速闪烁5次表示系统就绪
+            for (int i = 0; i < 5; i++) {
+                digitalWrite(LED_PIN, HIGH);
+                delay(100);
+                digitalWrite(LED_PIN, LOW);
+                delay(100);
+            }
+            
+            Serial.println("[SYSTEM] ✓ 系统就绪，可以开始语音交互！\n");
+            
+        } else if (currentTime - lastInitAttemptTime >= INIT_RETRY_INTERVAL) {
+            // 间隔时间到了，尝试重新初始化失败的服务
+            lastInitAttemptTime = currentTime;
+            
+            // 重试前再次检查WiFi状态
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("[SYSTEM] ⚠ WiFi未连接,跳过初始化重试");
+                return;
+            }
+            
+            Serial.println("\n[SYSTEM] ⟳ 检查服务初始化状态...");
+            Serial.printf("[SYSTEM] AI: %s, Speech: %s, RealtimeASR: %s\n",
+                         aiInitialized ? "✓" : "✗",
+                         speechInitialized ? "✓" : "✗",
+                         realtimeASRInitialized ? "✓" : "✗");
+            
+            // 重新初始化失败的服务
+            if (!aiInitialized) {
+                Serial.println("[AI] ⟳ 重新尝试初始化AI服务...");
+                setupAI();
+            }
+            
+            if (!speechInitialized) {
+                Serial.println("[SPEECH] ⟳ 重新尝试初始化语音服务...");
+                setupBaiduSpeech();
+            }
+            
+            if (!realtimeASRInitialized && useRealtimeASR) {
+                Serial.println("[REALTIME-ASR] ⟳ 重新尝试初始化实时识别...");
+                setupRealtimeASR();
+            }
+            
+            // 如果有任何一个服务初始化失败，继续循环
+            if (!aiInitialized || !speechInitialized || !realtimeASRInitialized) {
+                Serial.println("[SYSTEM] ⚠ 仍有服务未初始化，将在3秒后重试...\n");
+            }
+        }
+    }
     
     // 检查按钮状态（高频率检查以确保响应性）
     checkButton();
@@ -2022,69 +2154,9 @@ void loop() {
     }
     
     // WiFi状态检查和自动重连
-    if (currentTime - lastWiFiCheck > 15000) {  // 每15秒检查一次WiFi
+    if (currentTime - lastWiFiCheck > 3000) {  // 每3秒检查一次WiFi,快速响应断开
         lastWiFiCheck = currentTime;
-        
-        bool wasConnected = wifiWasConnected;
-        checkWiFiStatus();  // 使用我们的新函数
-        
-        bool isConnected = WiFi.status() == WL_CONNECTED;
-        
-        if (isConnected && !wasConnected) {
-            Serial.println("[WIFI] ✓ WiFi connection restored!");
-            Serial.printf("[WIFI] IP: %s, Signal: %d dBm\n", 
-                         WiFi.localIP().toString().c_str(), WiFi.RSSI());
-            
-            // 恢复连接指示
-            for (int i = 0; i < 3; i++) {
-                digitalWrite(LED_PIN, HIGH);
-                delay(100);
-                digitalWrite(LED_PIN, LOW);
-                delay(100);
-            }
-            
-            // 重新初始化AI服务
-            if (!aiInitialized) {
-                setupAI();
-            }
-            
-            // 重新初始化百度语音服务
-            if (!speechInitialized) {
-                Serial.println("[SPEECH] WiFi重连成功，尝试初始化百度语音服务...");
-                setupBaiduSpeech();
-            }
-            
-            // 检查是否所有服务都已初始化，并且之前未标记为完全初始化
-            if (!systemFullyInitialized && aiInitialized && speechInitialized && realtimeASRInitialized) {
-                systemFullyInitialized = true;
-                Serial.println("\n[SYSTEM] ✓ 所有服务初始化完成（WiFi重连后）！");
-                
-                // 播放初始化完成提示音
-                delay(500);
-                Serial.println("[SYSTEM] 播放初始化完成提示...");
-                speakTextStream("初始化已完成，现在可以开始了");
-                
-                // LED快速闪烁5次表示系统就绪
-                for (int i = 0; i < 5; i++) {
-                    digitalWrite(LED_PIN, HIGH);
-                    delay(100);
-                    digitalWrite(LED_PIN, LOW);
-                    delay(100);
-                }
-            }
-            
-        } else if (!isConnected && wasConnected) {
-            Serial.println("[WIFI] ✗ WiFi connection lost!");
-            aiInitialized = false; // WiFi断开时禁用AI
-            
-            // 连接丢失指示
-            for (int i = 0; i < 5; i++) {
-                digitalWrite(LED_PIN, HIGH);
-                delay(50);
-                digitalWrite(LED_PIN, LOW);
-                delay(50);
-            }
-        }
+        checkWiFiStatus();  // WiFi重连和初始化循环都在这个函数中处理
     }
     
     // 处理串口命令

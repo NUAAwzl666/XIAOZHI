@@ -6,6 +6,7 @@ BaiduRealtimeASR* BaiduRealtimeASR::instance = nullptr;
 BaiduRealtimeASR::BaiduRealtimeASR() {
     instance = this;
     connected = false;
+    lastReconnectAttempt = 0;
     partialResultCallback = nullptr;
     finalResultCallback = nullptr;
     errorCallback = nullptr;
@@ -102,10 +103,14 @@ void BaiduRealtimeASR::webSocketEventStatic(WStype_t type, uint8_t* payload, siz
 void BaiduRealtimeASR::webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
-            Serial.println("[REALTIME-ASR] WebSocket断开连接");
-            connected = false;
-            if (disconnectedCallback) {
-                disconnectedCallback();
+            // 只在第一次断开时打印,避免频繁输出
+            if (connected) {
+                Serial.println("[REALTIME-ASR] WebSocket断开连接");
+                connected = false;
+                lastReconnectAttempt = millis();  // 记录断开时间
+                if (disconnectedCallback) {
+                    disconnectedCallback();
+                }
             }
             break;
             
@@ -268,6 +273,27 @@ bool BaiduRealtimeASR::cancel() {
 }
 
 void BaiduRealtimeASR::loop() {
+    // 检查WiFi连接状态
+    if (WiFi.status() != WL_CONNECTED) {
+        // WiFi断开时不处理WebSocket,避免频繁重连错误
+        if (connected) {
+            connected = false;
+            Serial.println("[REALTIME-ASR] WiFi断开,暂停WebSocket");
+        }
+        return;
+    }
+    
+    // 如果未连接且距离上次重连尝试超过间隔时间,才尝试重连
+    if (!connected) {
+        unsigned long currentTime = millis();
+        if (currentTime - lastReconnectAttempt < RECONNECT_INTERVAL) {
+            // 还在重连间隔期内,不执行loop避免频繁错误
+            return;
+        }
+        // 更新重连尝试时间
+        lastReconnectAttempt = currentTime;
+    }
+    
     webSocket.loop();
 }
 

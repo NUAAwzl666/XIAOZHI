@@ -48,6 +48,8 @@ private:
     String sessionId;
     bool connected;
     String lastError;
+    unsigned long lastReconnectAttempt;  // 上次重连尝试时间
+    const unsigned long RECONNECT_INTERVAL = 5000;  // 重连间隔5秒
     
     // 回调函数指针
     void (*partialResultCallback)(const String& result);
