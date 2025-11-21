@@ -58,48 +58,53 @@ void onRealtimeError(int errNo, const String& errMsg);
 void onRealtimeConnected();
 void onRealtimeDisconnected();
 
-// 全局变量
+// ==================== 全局状态管理 ====================
+// 时间管理
 unsigned long lastStatusReport = 0;
 unsigned long lastWiFiCheck = 0;
 unsigned long lastHeartbeat = 0;
+unsigned long lastInitAttemptTime = 0;
+unsigned long recordingStartTime = 0;
+
+// 系统标志
+bool systemFullyInitialized = false;
+bool isInitializing = false;
 bool wifiWasConnected = false;
+bool pendingInitTTS = false;
+bool isPlayingInitTTS = false;
 int commandCount = 0;
 
-// 按钮状态变量
+// 按钮状态
 bool lastButtonState = HIGH;
 bool currentButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
+
+// 录音状态
 bool isRecording = false;
-unsigned long recordingStartTime = 0;  // 添加录音开始时间追踪
+bool isConnecting = false;
+size_t recordedSize = 0;
+String fullRecognizedText = "";
 
-// AI服务状态
+// 服务状态
 bool aiInitialized = false;
-int conversationCount = 0;
-
-// 语音服务状态
-BaiduSpeech baiduSpeech;
-BaiduRealtimeASR realtimeASR;
 bool speechInitialized = false;
 bool realtimeASRInitialized = false;
-size_t recordedSize = 0;
-String fullRecognizedText = "";  // 存储完整识别结果
+int conversationCount = 0;
 
 // 音频缓存（用于WebSocket连接期间的临时存储）
 #define AUDIO_CACHE_SIZE (16000 * 2 * 2)  // 2秒音频缓存
 uint8_t* audioCache = nullptr;
 size_t audioCacheSize = 0;
-bool isConnecting = false;
 
-// 系统初始化状态
-bool systemFullyInitialized = false;  // 标记系统是否完全初始化完成
-bool isInitializing = false;           // 标记是否正在初始化循环中
-unsigned long lastInitAttemptTime = 0; // 上次初始化尝试时间
-const unsigned long INIT_RETRY_INTERVAL = 3000; // 初始化重试间隔(3秒)
-bool pendingInitTTS = false;           // 标记是否有初始化完成提示音待播报
-bool isPlayingInitTTS = false;         // 初始化提示音是否正在播放
+// 服务实例
+BaiduSpeech baiduSpeech;
+BaiduRealtimeASR realtimeASR;
 
 // 扬声器输出状态
 static bool speakerInitialized = false;
+
+// 常量定义
+const unsigned long INIT_RETRY_INTERVAL = 3000; // 初始化重试间隔(3秒)
 
 // LED状态管理
 enum LEDMode {
@@ -1861,15 +1866,240 @@ void setup() {
     Serial.println("[SERIAL] Serial port ready, waiting for commands...\n");
 }
 
-void loop() {
-    unsigned long currentTime = millis();
+// ==================== Loop辅助函数 ====================
+
+// 串口命令处理
+void processSerialCommands() {
+    if (!Serial.available()) {
+        return;
+    }
     
-    // 更新LED状态（非阻塞），确保闪烁/常亮及时生效
-    updateLED();
+    String input = Serial.readStringUntil('\n');
+    input.trim();
     
-    // ==================== 初始化循环管理 ====================
-    // 如果正在初始化循环中，持续检查和重试
-    // 初始化完成提示音异步播放，优先保证按钮录音响应
+    // 添加调试输出
+    Serial.printf("[DEBUG] Raw input: '%s' (length: %d)\n", input.c_str(), input.length());
+    
+    if (input.length() == 0) {
+        return;
+    }
+    
+    commandCount++;
+    Serial.printf("[CMD] Processing #%d: '%s'\n", commandCount, input.c_str());
+    
+    // 简单的命令反馈测试
+    Serial.println("[INFO] Command received, processing...");
+    
+    // 转换为小写进行命令识别
+    String command = input;
+    command.toLowerCase();
+    
+    // 基本命令
+    if (command == "ping") {
+        Serial.println("[PING] Pong! System is responsive.");
+        return;
+    }
+    
+    if (command == "button" || command == "btn") {
+        Serial.println("[BUTTON] 按钮状态测试:");
+        Serial.printf("  GPIO%d 当前状态: %s\n", BUTTON_PIN, digitalRead(BUTTON_PIN) ? "HIGH (未按下)" : "LOW (按下)");
+        Serial.printf("  上次状态: %s\n", lastButtonState ? "HIGH" : "LOW");
+        Serial.printf("  当前确认状态: %s\n", currentButtonState ? "HIGH" : "LOW");
+        Serial.printf("  防抖延时: %d ms\n", BUTTON_DEBOUNCE);
+        Serial.println("  请按下Boot按钮测试...");
+        return;
+    }
+    
+    if (command == "testbutton") {
+        Serial.println("[BUTTON] 模拟按钮按下测试...");
+        handleButtonPress();
+        return;
+    }
+    
+    // 系统命令
+    if (command == "status") {
+        Serial.println("[STATUS] System status report:");
+        printDetailedStatus();
+    } else if (command == "restart") {
+        Serial.println("[SYSTEM] ⚠️ System restarting in 3 seconds...");
+        for (int i = 3; i > 0; i--) {
+            Serial.printf("[SYSTEM] Restart countdown: %d\n", i);
+            digitalWrite(LED_PIN, HIGH);
+            delay(500);
+            digitalWrite(LED_PIN, LOW);
+            delay(500);
+        }
+        ESP.restart();
+    } else if (command == "reset") {
+        Serial.println("[SYSTEM] 软重启系统...");
+        ESP.restart();
+    } else if (command == "help") {
+        printHelp();
+    }
+    
+    // 硬件测试命令
+    else if (command == "led") {
+        Serial.println("[LED] Running LED test sequence...");
+        testLED();
+    } else if (command == "checkgpio") {
+        Serial.println("\n========== GPIO状态检查 ==========");
+        Serial.printf("I2S扬声器GPIO配置:\n");
+        Serial.printf("  BCLK  = GPIO%d\n", I2S_SPK_SCK_PIN);
+        Serial.printf("  LRCLK = GPIO%d\n", I2S_SPK_WS_PIN);
+        Serial.printf("  DIN   = GPIO%d\n", I2S_SPK_SD_PIN);
+        Serial.println("\n⚠️ MAX98357A硬件检查：");
+        Serial.println("1. SD引脚必须悬空或接5V (不能接GND!)");
+        Serial.println("2. VIN引脚必须接5V (不能接3.3V)");
+        Serial.println("3. GAIN引脚悬空可获得最大15dB增益");
+        Serial.println("4. 扬声器阻抗应为4-8欧姆");
+        Serial.println("\n详细故障排查请查看: MAX98357A_TROUBLESHOOTING.md");
+        Serial.println("====================================\n");
+    }
+    
+    // 网络命令
+    else if (command == "wifi") {
+        Serial.println("[WIFI] WiFi information:");
+        printWiFiInfo();
+    } else if (command == "reconnect") {
+        Serial.println("[WIFI] 强制重新连接WiFi...");
+        WiFi.disconnect();
+        delay(1000);
+        checkWiFiStatus();
+    } else if (command == "nettest") {
+        Serial.println("[NETWORK] Testing network connectivity...");
+        testNetworkConnectivity();
+    } else if (command == "httptest") {
+        testSimpleHTTP();
+    }
+    
+    // 内存命令
+    else if (command == "memory") {
+        Serial.println("[MEMORY] Memory information:");
+        printMemoryInfo();
+    } else if (command == "cleanup") {
+        Serial.println("[MAINTENANCE] 手动清理内存...");
+        uint32_t beforeHeap = ESP.getFreeHeap();
+        ESP.getMaxAllocHeap();
+        uint32_t afterHeap = ESP.getFreeHeap();
+        Serial.printf("[CLEANUP] 内存清理完成: %d -> %d bytes (+%d)\n", 
+                     beforeHeap, afterHeap, afterHeap - beforeHeap);
+    }
+    
+    // AI服务命令
+    else if (command == "ai") {
+        Serial.println("[AI] AI services status:");
+        printAIStatus();
+    } else if (command == "test") {
+        testAIServices();
+    } else if (command.startsWith("chat ")) {
+        String message = input.substring(5);
+        if (aiInitialized) {
+            Serial.printf("你: %s\n", message.c_str());
+            String response = chatWithDeepSeek(message);
+            Serial.printf("小智: %s\n", response.c_str());
+        } else {
+            Serial.println("AI服务未初始化，请检查网络连接");
+        }
+    }
+    
+    // 语音服务命令
+    else if (command == "speech") {
+        Serial.println("[SPEECH] Speech services status:");
+        printSpeechStatus();
+    } else if (command == "speechtest") {
+        testBaiduSpeech();
+    } else if (command == "baidutoken") {
+        testBaiduTokenAPI();
+    } else if (command == "record") {
+        startRealtimeRecording();
+    } else if (command == "stop") {
+        if (isRecording) {
+            stopRealtimeRecording();
+        } else {
+            Serial.println("当前未在录音");
+        }
+    } else if (command.startsWith("tts ")) {
+        String text = input.substring(4);
+        if (speechInitialized) {
+            Serial.printf("TTS: %s\n", text.c_str());
+            uint8_t* ttsAudio = nullptr;
+            size_t ttsSize = 0;
+            
+            if (baiduSpeech.synthesizeSpeech(text, &ttsAudio, &ttsSize)) {
+                Serial.printf("语音合成成功，播放音频...\n");
+                playTTSAudio(ttsAudio, ttsSize);
+                if (ttsAudio) {
+                    free(ttsAudio);
+                }
+            } else {
+                Serial.printf("语音合成失败: %s\n", baiduSpeech.getLastError().c_str());
+            }
+        } else {
+            Serial.println("语音服务未初始化");
+        }
+    } else if (command.startsWith("ttsstream ")) {
+        String text = input.substring(String("ttsstream ").length());
+        if (speechInitialized) {
+            Serial.printf("TTS Stream: %s\n", text.c_str());
+            speakTextStream(text);
+        } else {
+            Serial.println("语音服务未初始化");
+        }
+    }
+    
+    // 音频测试命令
+    else if (command == "volume" || command.startsWith("volume ")) {
+        if (command.startsWith("volume ")) {
+            int vol = input.substring(String("volume ").length()).toInt();
+            if (vol >= 0 && vol <= 100) {
+                AudioI2C::setVolume(vol);
+                Serial.printf("[VOLUME] 音量已设置为: %d%%, 增益: %.2fx\n", 
+                              vol, AudioI2C::getSoftwareGain());
+                playTestTone(1000, 300);
+            } else {
+                Serial.println("[VOLUME] 音量范围: 0-100");
+            }
+        } else {
+            Serial.printf("[VOLUME] 当前音量: %d%%, 增益: %.2fx\n", 
+                          AudioI2C::getVolume(), AudioI2C::getSoftwareGain());
+            Serial.println("[VOLUME] 用法: volume [0-100]");
+        }
+    } else if (command == "testtone" || command.startsWith("testtone ")) {
+        int freq = 1000;
+        int duration = 1000;
+        
+        if (command.startsWith("testtone ")) {
+            String params = input.substring(String("testtone ").length());
+            int spaceIdx = params.indexOf(' ');
+            if (spaceIdx > 0) {
+                freq = params.substring(0, spaceIdx).toInt();
+                duration = params.substring(spaceIdx + 1).toInt();
+            } else {
+                freq = params.toInt();
+            }
+        }
+        
+        Serial.printf("播放测试音: %dHz, %dms (音量:%d%%)\n", freq, duration, AudioI2C::getVolume());
+        playTestTone(freq, duration);
+    }
+    
+    // 默认：作为聊天消息处理
+    else {
+        if (aiInitialized && input.length() > 0) {
+            Serial.printf("你: %s\n", input.c_str());
+            String response = chatWithDeepSeek(input);
+            Serial.printf("小智: %s\n", response.c_str());
+        } else if (!aiInitialized) {
+            Serial.println("AI服务未初始化，请检查网络连接或输入'ai'查看状态");
+        } else {
+            Serial.printf("[CMD] ✗ Unknown command: '%s'\n", command.c_str());
+            Serial.println("[HELP] Type 'help' to see available commands");
+        }
+    }
+}
+
+// 处理初始化完成提示音
+static void handleInitCompleteTTS() {
     if (pendingInitTTS && !isRecording && !isPlayingInitTTS) {
         Serial.println("[SYSTEM] 🔊 播放初始化完成提示...");
         isPlayingInitTTS = true;
@@ -1877,97 +2107,292 @@ void loop() {
         isPlayingInitTTS = false;
         pendingInitTTS = false;
     }
+}
 
-    if (isInitializing && !systemFullyInitialized) {
-        // 先检查WiFi状态,如果断开则停止初始化
-        if (WiFi.status() != WL_CONNECTED) {
-            if (wifiWasConnected) {
-                Serial.println("[SYSTEM] ⚠ 初始化期间检测到WiFi断开,停止初始化循环");
-                isInitializing = false;
-                wifiWasConnected = false;
-                
-                // 播放警告提示音
-                Serial.println("[WIFI] ⚠ 网络连接已断开，请检查");
-                playWarningBeep();
-                
-                // LED快闪
-                if (!isRecording) {
-                    setLEDMode(LED_BLINK_FAST);
-                }
-            }
-            return;  // 跳过本次循环
-        }
-        
-        // 检查当前初始化状态
-        bool allServicesInitialized = aiInitialized && speechInitialized && realtimeASRInitialized;
-        
-        if (allServicesInitialized) {
-            // 所有服务初始化成功！
-            systemFullyInitialized = true;
+// 检查WiFi状态并处理断线
+static bool checkWiFiForInit() {
+    if (WiFi.status() != WL_CONNECTED) {
+        if (wifiWasConnected) {
+            Serial.println("[SYSTEM] ⚠ 初始化期间检测到WiFi断开,停止初始化循环");
             isInitializing = false;
-            Serial.println("\n[SYSTEM] ══════════════════════════════════════");
-            Serial.println("[SYSTEM] ✓ 所有服务初始化完成！");
-            Serial.println("[SYSTEM] ══════════════════════════════════════");
-            Serial.printf("[SYSTEM] AI服务: ✓\n");
-            Serial.printf("[SYSTEM] 语音服务: ✓\n");
-            Serial.printf("[SYSTEM] 实时识别: ✓\n");
-            Serial.println("[SYSTEM] ══════════════════════════════════════\n");
-            // 标记有初始化提示音待播报
-            pendingInitTTS = true;
-            // LED快速闪烁5次表示系统就绪
-            for (int i = 0; i < 5; i++) {
-                digitalWrite(LED_PIN, HIGH);
-                delay(100);
-                digitalWrite(LED_PIN, LOW);
-                delay(100);
-            }
-            Serial.println("[SYSTEM] ✓ 系统就绪，可以开始语音交互！\n");
-        } else if (currentTime - lastInitAttemptTime >= INIT_RETRY_INTERVAL) {
-                // 初始化完成提示音异步播放，优先保证按钮录音响应
-                if (pendingInitTTS && !isRecording) {
-                    Serial.println("[SYSTEM] 🔊 播放初始化完成提示...");
-                    isPlayingInitTTS = true;
-                    speakTextStream("初始化已完成，现在可以开始了");
-                    isPlayingInitTTS = false;
-                    pendingInitTTS = false;
-                }
-            // 间隔时间到了，尝试重新初始化失败的服务
-            lastInitAttemptTime = currentTime;
+            wifiWasConnected = false;
             
-            // 重试前再次检查WiFi状态
-            if (WiFi.status() != WL_CONNECTED) {
-                Serial.println("[SYSTEM] ⚠ WiFi未连接,跳过初始化重试");
-                return;
-            }
+            Serial.println("[WIFI] ⚠ 网络连接已断开，请检查");
+            playWarningBeep();
             
-            Serial.println("\n[SYSTEM] ⟳ 检查服务初始化状态...");
-            Serial.printf("[SYSTEM] AI: %s, Speech: %s, RealtimeASR: %s\n",
-                         aiInitialized ? "✓" : "✗",
-                         speechInitialized ? "✓" : "✗",
-                         realtimeASRInitialized ? "✓" : "✗");
-            
-            // 重新初始化失败的服务
-            if (!aiInitialized) {
-                Serial.println("[AI] ⟳ 重新尝试初始化AI服务...");
-                setupAI();
+            if (!isRecording) {
+                setLEDMode(LED_BLINK_FAST);
             }
-            
-            if (!speechInitialized) {
-                Serial.println("[SPEECH] ⟳ 重新尝试初始化语音服务...");
-                setupBaiduSpeech();
-            }
-            
-            if (!realtimeASRInitialized) {
-                Serial.println("[REALTIME-ASR] ⟳ 重新尝试初始化实时识别...");
-                setupRealtimeASR();
-            }
-            
-            // 如果有任何一个服务初始化失败，继续循环
-            if (!aiInitialized || !speechInitialized || !realtimeASRInitialized) {
-                Serial.println("[SYSTEM] ⚠ 仍有服务未初始化，将在3秒后重试...\n");
-            }
+        }
+        return false;
+    }
+    return true;
+}
+
+// 检查所有服务是否初始化完成
+static void checkServicesInitialization() {
+    bool allServicesInitialized = aiInitialized && speechInitialized && realtimeASRInitialized;
+    
+    if (allServicesInitialized) {
+        systemFullyInitialized = true;
+        isInitializing = false;
+        
+        Serial.println("\n[SYSTEM] ══════════════════════════════════════");
+        Serial.println("[SYSTEM] ✓ 所有服务初始化完成！");
+        Serial.println("[SYSTEM] ══════════════════════════════════════");
+        Serial.printf("[SYSTEM] AI服务: ✓\n");
+        Serial.printf("[SYSTEM] 语音服务: ✓\n");
+        Serial.printf("[SYSTEM] 实时识别: ✓\n");
+        Serial.println("[SYSTEM] ══════════════════════════════════════\n");
+        
+        pendingInitTTS = true;
+        
+        // LED快速闪烁5次表示系统就绪
+        for (int i = 0; i < 5; i++) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(100);
+            digitalWrite(LED_PIN, LOW);
+            delay(100);
+        }
+        Serial.println("[SYSTEM] ✓ 系统就绪，可以开始语音交互！\n");
+    }
+}
+
+// 重试初始化失败的服务
+static void retryFailedServices(unsigned long currentTime) {
+    if (currentTime - lastInitAttemptTime < INIT_RETRY_INTERVAL) {
+        return;
+    }
+    
+    lastInitAttemptTime = currentTime;
+    
+    if (!checkWiFiForInit()) {
+        return;
+    }
+    
+    Serial.println("\n[SYSTEM] ⟳ 检查服务初始化状态...");
+    Serial.printf("[SYSTEM] AI: %s, Speech: %s, RealtimeASR: %s\n",
+                 aiInitialized ? "✓" : "✗",
+                 speechInitialized ? "✓" : "✗",
+                 realtimeASRInitialized ? "✓" : "✗");
+    
+    if (!aiInitialized) {
+        Serial.println("[AI] ⟳ 重新尝试初始化AI服务...");
+        setupAI();
+    }
+    
+    if (!speechInitialized) {
+        Serial.println("[SPEECH] ⟳ 重新尝试初始化语音服务...");
+        setupBaiduSpeech();
+    }
+    
+    if (!realtimeASRInitialized) {
+        Serial.println("[REALTIME-ASR] ⟳ 重新尝试初始化实时识别...");
+        setupRealtimeASR();
+    }
+    
+    if (!aiInitialized || !speechInitialized || !realtimeASRInitialized) {
+        Serial.println("[SYSTEM] ⚠ 仍有服务未初始化，将在3秒后重试...\n");
+    }
+}
+
+// 处理初始化循环
+static void handleInitializationLoop(unsigned long currentTime) {
+    handleInitCompleteTTS();
+    
+    if (!isInitializing || systemFullyInitialized) {
+        return;
+    }
+    
+    if (!checkWiFiForInit()) {
+        return;
+    }
+    
+    checkServicesInitialization();
+    
+    if (!systemFullyInitialized) {
+        retryFailedServices(currentTime);
+    }
+}
+
+// 检查录音超时
+static void checkRecordingTimeout(unsigned long currentTime) {
+    if (!isRecording || recordingStartTime == 0) {
+        return;
+    }
+    
+    if (currentTime < recordingStartTime) {
+        Serial.printf("[RECORD] 时间异常 - 当前: %lu, 开始: %lu\n", currentTime, recordingStartTime);
+        return;
+    }
+    
+    unsigned long recordingDuration = currentTime - recordingStartTime;
+    if (recordingDuration > MAX_RECORD_TIME) {
+        Serial.println("[RECORD] ⚠️ 录音超时，自动停止录音");
+        Serial.printf("[RECORD] 当前时间: %lu ms, 开始时间: %lu ms\n", currentTime, recordingStartTime);
+        Serial.printf("[RECORD] 录音时长: %lu 毫秒 (%.1f秒)\n", recordingDuration, recordingDuration / 1000.0);
+        Serial.printf("[RECORD] 最大录音时间: %d ms\n", MAX_RECORD_TIME);
+        
+        stopRealtimeRecording();
+    }
+}
+
+// WiFi状态检查和自动重连
+static void checkWiFiConnection(unsigned long currentTime) {
+    if (currentTime - lastWiFiCheck <= 3000) {
+        return;
+    }
+    
+    lastWiFiCheck = currentTime;
+    checkWiFiStatus();
+}
+
+// 更新系统心跳和内存状态
+static void updateSystemHeartbeat(unsigned long currentTime) {
+    if (currentTime - lastHeartbeat <= 30000) {
+        return;
+    }
+    
+    lastHeartbeat = currentTime;
+    Serial.printf("[HEARTBEAT] System running - Uptime: %lu seconds", currentTime / 1000);
+    if (aiInitialized) {
+        Serial.printf(" | AI: Ready | Conversations: %d", conversationCount);
+    }
+    Serial.println();
+    
+    // 显示内存状态
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 100000) {  // 如果可用内存少于100KB，警告
+        Serial.printf("[WARNING] Low memory: %d bytes\n", freeHeap);
+    }
+    
+    // 定期清理，防止内存泄漏
+    if (conversationCount > 0 && (conversationCount % 5 == 0)) {
+        Serial.println("[MAINTENANCE] 定期清理内存...");
+        ESP.getMaxAllocHeap(); // 触发垃圾回收
+    }
+    
+    // 内存过低时的紧急清理
+    if (freeHeap < 60000) {
+        Serial.println("[MAINTENANCE] 内存不足，执行紧急清理...");
+        ESP.getMaxAllocHeap();
+        
+        if (ESP.getFreeHeap() < 50000) {
+            Serial.println("[CRITICAL] 内存严重不足，建议重启系统");
+            Serial.println("[HELP] 输入 'restart' 重启系统");
         }
     }
+}
+
+// 处理实时录音数据采集
+static void handleRealtimeRecording() {
+    if (!isRecording) {
+        // 重置首帧标记（停止录音时）
+        static bool firstFrame = true;
+        firstFrame = true;
+        return;
+    }
+    
+    size_t bytes_read = 0;
+    int32_t i2s_buffer[512];  // 32位I2S缓冲区，512样本×4字节=2048字节
+    
+    esp_err_t result = i2s_read(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytes_read, 100);
+    
+    if (result != ESP_OK || bytes_read == 0) {
+        return;
+    }
+    
+    // 首帧时间戳日志（用于验证采样延迟）
+    static bool firstFrame = true;
+    if (firstFrame) {
+        unsigned long firstFrameTime = millis();
+        unsigned long delayFromPress = firstFrameTime - recordingStartTime;
+        Serial.printf("[REALTIME] ★ 首帧采样完成 t=%lu ms, 距按键 %lu ms\n", 
+                      firstFrameTime, delayFromPress);
+        firstFrame = false;
+    }
+    
+    // 转换32位数据到16位
+    size_t samples_read = bytes_read / 4;  // 32位 = 4字节
+    uint8_t pcm_buffer[samples_read * 2];  // 16位 = 2字节
+    int16_t* output_ptr = (int16_t*)pcm_buffer;
+    
+    for (size_t i = 0; i < samples_read; i++) {
+        // INMP441的数据在32位的高18位，右移14位得到16位数据
+        output_ptr[i] = (int16_t)(i2s_buffer[i] >> 14);
+    }
+    
+    // 优先缓存音频，异步建立连接
+    if (!realtimeASR.isConnected()) {
+        // 先缓存当前帧
+        if (audioCache && audioCacheSize + samples_read * 2 < AUDIO_CACHE_SIZE) {
+            memcpy(audioCache + audioCacheSize, pcm_buffer, samples_read * 2);
+            audioCacheSize += samples_read * 2;
+        }
+        
+        // 异步尝试连接（首次立即尝试，之后每200ms重试）
+        static unsigned long lastConnectAttempt = 0;
+        static bool firstConnectAttempt = true;
+        unsigned long now = millis();
+        
+        if (isConnecting && (firstConnectAttempt || now - lastConnectAttempt > 200)) {
+            if (firstConnectAttempt) {
+                Serial.printf("[REALTIME] 开始异步连接ASR (t=%lu ms, 已缓存 %d bytes)\n", 
+                              now, audioCacheSize);
+                firstConnectAttempt = false;
+            }
+            
+            if (realtimeASR.connect()) {
+                unsigned long connectTime = millis();
+                Serial.printf("[REALTIME] ★ ASR连接成功 t=%lu ms (耗时 %lu ms)\n", 
+                              connectTime, connectTime - recordingStartTime);
+                isConnecting = false;
+                firstConnectAttempt = true;  // 重置供下次使用
+                
+                // 立即发送所有缓存
+                if (audioCacheSize > 0) {
+                    Serial.printf("[REALTIME] ★ 发送缓存音频: %d bytes (t=%lu ms)\n", 
+                                  audioCacheSize, millis());
+                    realtimeASR.sendAudioData(audioCache, audioCacheSize);
+                    recordedSize += audioCacheSize;
+                    audioCacheSize = 0;
+                }
+                
+                // 发送当前帧
+                realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
+                recordedSize += samples_read * 2;
+            } else {
+                // 定期输出缓存状态
+                static unsigned long lastCacheLog = 0;
+                if (now - lastCacheLog > 500) {
+                    Serial.printf("[REALTIME] 连接中...已缓存 %d bytes\n", audioCacheSize);
+                    lastCacheLog = now;
+                }
+            }
+            lastConnectAttempt = now;
+        }
+    } else {
+        // 已连接，直接发送
+        realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
+        recordedSize += samples_read * 2;
+        
+        // 定期输出进度
+        static unsigned long lastProgressLog = 0;
+        if (millis() - lastProgressLog > 1000) {
+            Serial.printf("[REALTIME] 已发送 %d bytes\n", recordedSize);
+            lastProgressLog = millis();
+        }
+    }
+}
+
+void loop() {
+    unsigned long currentTime = millis();
+    
+    // 更新LED状态（非阻塞），确保闪烁/常亮及时生效
+    updateLED();
+    
+    // 初始化循环管理
+    handleInitializationLoop(currentTime);
     
     // 检查按钮状态（高频率检查以确保响应性）
     checkButton();
@@ -1978,370 +2403,17 @@ void loop() {
     }
     
     // 检查录音超时（防止按钮卡住导致无限录音）
-    if (isRecording && recordingStartTime > 0) {
-        // 重新获取当前时间，避免竞态条件
-        currentTime = millis();
-        
-        // 检查时间是否合理（防止下溢）
-        if (currentTime >= recordingStartTime) {
-            unsigned long recordingDuration = currentTime - recordingStartTime;
-            if (recordingDuration > MAX_RECORD_TIME) {
-                Serial.println("[RECORD] ⚠️ 录音超时，自动停止录音");
-                Serial.printf("[RECORD] 当前时间: %lu ms, 开始时间: %lu ms\n", currentTime, recordingStartTime);
-                Serial.printf("[RECORD] 录音时长: %lu 毫秒 (%.1f秒)\n", recordingDuration, recordingDuration / 1000.0);
-                Serial.printf("[RECORD] 最大录音时间: %d ms\n", MAX_RECORD_TIME);
-                
-                // 停止实时录音
-                stopRealtimeRecording();
-            }
-        } else {
-            // 时间异常，可能是刚刚开始录音
-            Serial.printf("[RECORD] 时间异常 - 当前: %lu, 开始: %lu\n", currentTime, recordingStartTime);
-        }
-    }
+    checkRecordingTimeout(currentTime);
     
-    // Heartbeat每30秒显示一次，并进行系统维护
-    if (currentTime - lastHeartbeat > 30000) {
-        lastHeartbeat = currentTime;
-        Serial.printf("[HEARTBEAT] System running - Uptime: %lu seconds", currentTime / 1000);
-        if (aiInitialized) {
-            Serial.printf(" | AI: Ready | Conversations: %d", conversationCount);
-        }
-        Serial.println();
-        
-        // 显示内存状态
-        uint32_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < 100000) {  // 如果可用内存少于100KB，警告
-            Serial.printf("[WARNING] Low memory: %d bytes\n", freeHeap);
-        }
-        
-        // 定期清理，防止内存泄漏
-        if (conversationCount > 0 && (conversationCount % 5 == 0)) {
-            Serial.println("[MAINTENANCE] 定期清理内存...");
-            ESP.getMaxAllocHeap(); // 触发垃圾回收
-        }
-        
-        // 内存过低时的紧急清理
-        if (freeHeap < 60000) {
-            Serial.println("[MAINTENANCE] 内存不足，执行紧急清理...");
-            ESP.getMaxAllocHeap();
-            
-            if (ESP.getFreeHeap() < 50000) {
-                Serial.println("[CRITICAL] 内存严重不足，建议重启系统");
-                Serial.println("[HELP] 输入 'restart' 重启系统");
-            }
-        }
-    }
+    // 系统心跳和内存维护
+    updateSystemHeartbeat(currentTime);
     
     // WiFi状态检查和自动重连
-    if (currentTime - lastWiFiCheck > 3000) {  // 每3秒检查一次WiFi,快速响应断开
-        lastWiFiCheck = currentTime;
-        checkWiFiStatus();  // WiFi重连和初始化循环都在这个函数中处理
-    }
+    checkWiFiConnection(currentTime);
     
     // 处理串口命令
-    if (Serial.available()) {
-        String input = Serial.readStringUntil('\n');
-        input.trim();
-        
-        // 添加调试输出
-        Serial.printf("[DEBUG] Raw input: '%s' (length: %d)\n", input.c_str(), input.length());
-        
-        if (input.length() > 0) {
-            commandCount++;
-            Serial.printf("[CMD] Processing #%d: '%s'\n", commandCount, input.c_str());
-            
-            // 简单的命令反馈测试
-            Serial.println("[INFO] Command received, processing...");
-            
-            // 转换为小写进行命令识别
-            String command = input;
-            command.toLowerCase();
-            
-            // 添加基本命令测试
-            if (command == "ping") {
-                Serial.println("[PING] Pong! System is responsive.");
-                return;
-            }
-            
-            if (command == "button" || command == "btn") {
-                Serial.println("[BUTTON] 按钮状态测试:");
-                Serial.printf("  GPIO%d 当前状态: %s\n", BUTTON_PIN, digitalRead(BUTTON_PIN) ? "HIGH (未按下)" : "LOW (按下)");
-                Serial.printf("  上次状态: %s\n", lastButtonState ? "HIGH" : "LOW");
-                Serial.printf("  当前确认状态: %s\n", currentButtonState ? "HIGH" : "LOW");
-                Serial.printf("  防抖延时: %d ms\n", BUTTON_DEBOUNCE);
-                Serial.println("  请按下Boot按钮测试...");
-                return;
-            }
-            
-            if (command == "testbutton") {
-                Serial.println("[BUTTON] 模拟按钮按下测试...");
-                handleButtonPress();
-                return;
-            }
-            
-            if (command == "status") {
-                Serial.println("[STATUS] System status report:");
-                printDetailedStatus();
-            } else if (command == "restart") {
-                Serial.println("[SYSTEM] ⚠️ System restarting in 3 seconds...");
-                for (int i = 3; i > 0; i--) {
-                    Serial.printf("[SYSTEM] Restart countdown: %d\n", i);
-                    digitalWrite(LED_PIN, HIGH);
-                    delay(500);
-                    digitalWrite(LED_PIN, LOW);
-                    delay(500);
-                }
-                ESP.restart();
-            } else if (command == "led") {
-                Serial.println("[LED] Running LED test sequence...");
-                testLED();
-            } else if (command == "wifi") {
-                Serial.println("[WIFI] WiFi information:");
-                printWiFiInfo();
-            } else if (command == "memory") {
-                Serial.println("[MEMORY] Memory information:");
-                printMemoryInfo();
-            } else if (command == "nettest") {
-                Serial.println("[NETWORK] Testing network connectivity...");
-                testNetworkConnectivity();
-            } else if (command == "reconnect") {
-                Serial.println("[WIFI] 强制重新连接WiFi...");
-                WiFi.disconnect();
-                delay(1000);
-                checkWiFiStatus();
-            } else if (command == "reset") {
-                Serial.println("[SYSTEM] 软重启系统...");
-                ESP.restart();
-            } else if (command == "cleanup") {
-                Serial.println("[MAINTENANCE] 手动清理内存...");
-                uint32_t beforeHeap = ESP.getFreeHeap();
-                ESP.getMaxAllocHeap(); // 触发垃圾回收
-                uint32_t afterHeap = ESP.getFreeHeap();
-                Serial.printf("[CLEANUP] 内存清理完成: %d -> %d bytes (+%d)\n", 
-                             beforeHeap, afterHeap, afterHeap - beforeHeap);
-            } else if (command == "help") {
-                printHelp();
-            } else if (command == "ai") {
-                Serial.println("[AI] AI services status:");
-                printAIStatus();
-            } else if (command == "test") {
-                testAIServices();
-            } else if (command == "speech") {
-                Serial.println("[SPEECH] Speech services status:");
-                printSpeechStatus();
-            } else if (command == "speechtest") {
-                testBaiduSpeech();
-            } else if (command == "baidutoken") {
-                testBaiduTokenAPI();
-            } else if (command == "httptest") {
-                testSimpleHTTP();
-            } else if (command == "record") {
-                startRealtimeRecording();
-            } else if (command == "stop") {
-                if (isRecording) {
-                    stopRealtimeRecording();
-                } else {
-                    Serial.println("当前未在录音");
-                }
-            } else if (command.startsWith("tts ")) {
-                // 文本转语音测试
-                String text = input.substring(4);
-                if (speechInitialized) {
-                    Serial.printf("TTS: %s\n", text.c_str());
-                    uint8_t* ttsAudio = nullptr;
-                    size_t ttsSize = 0;
-                    
-                    if (baiduSpeech.synthesizeSpeech(text, &ttsAudio, &ttsSize)) {
-                        Serial.printf("语音合成成功，播放音频...\n");
-                        playTTSAudio(ttsAudio, ttsSize);
-                        if (ttsAudio) {
-                            free(ttsAudio);
-                        }
-                    } else {
-                        Serial.printf("语音合成失败: %s\n", baiduSpeech.getLastError().c_str());
-                    }
-                } else {
-                    Serial.println("语音服务未初始化");
-                }
-            } else if (command.startsWith("ttsstream ")) {
-                // 流式文本转语音测试
-                String text = input.substring(String("ttsstream ").length());
-                if (speechInitialized) {
-                    Serial.printf("TTS Stream: %s\n", text.c_str());
-                    speakTextStream(text);
-                } else {
-                    Serial.println("语音服务未初始化");
-                }
-            } else if (command == "volume" || command.startsWith("volume ")) {
-                // 设置或查询音量: volume [0-100]
-                if (command.startsWith("volume ")) {
-                    int vol = input.substring(String("volume ").length()).toInt();
-                    if (vol >= 0 && vol <= 100) {
-                        AudioI2C::setVolume(vol);
-                        Serial.printf("[VOLUME] 音量已设置为: %d%%, 增益: %.2fx\n", 
-                                      vol, AudioI2C::getSoftwareGain());
-                        // 播放提示音验证音量
-                        playTestTone(1000, 300);
-                    } else {
-                        Serial.println("[VOLUME] 音量范围: 0-100");
-                    }
-                } else {
-                    Serial.printf("[VOLUME] 当前音量: %d%%, 增益: %.2fx\n", 
-                                  AudioI2C::getVolume(), AudioI2C::getSoftwareGain());
-                    Serial.println("[VOLUME] 用法: volume [0-100]");
-                }
-            } else if (command == "testtone" || command.startsWith("testtone ")) {
-                // 测试音调（用于硬件诊断）
-                int freq = 1000; // 默认1000Hz
-                int duration = 1000; // 默认1秒
-                
-                if (command.startsWith("testtone ")) {
-                    String params = input.substring(String("testtone ").length());
-                    int spaceIdx = params.indexOf(' ');
-                    if (spaceIdx > 0) {
-                        freq = params.substring(0, spaceIdx).toInt();
-                        duration = params.substring(spaceIdx + 1).toInt();
-                    } else {
-                        freq = params.toInt();
-                    }
-                }
-                
-                Serial.printf("播放测试音: %dHz, %dms (音量:%d%%)\n", freq, duration, AudioI2C::getVolume());
-                playTestTone(freq, duration);
-            } else if (command == "checkgpio") {
-                // 检查I2S GPIO状态
-                Serial.println("\n========== GPIO状态检查 ==========");
-                Serial.printf("I2S扬声器GPIO配置:\n");
-                Serial.printf("  BCLK  = GPIO%d\n", I2S_SPK_SCK_PIN);
-                Serial.printf("  LRCLK = GPIO%d\n", I2S_SPK_WS_PIN);
-                Serial.printf("  DIN   = GPIO%d\n", I2S_SPK_SD_PIN);
-                Serial.println("\n⚠️ MAX98357A硬件检查：");
-                Serial.println("1. SD引脚必须悬空或接5V (不能接GND!)");
-                Serial.println("2. VIN引脚必须接5V (不能接3.3V)");
-                Serial.println("3. GAIN引脚悬空可获得最大15dB增益");
-                Serial.println("4. 扬声器阻抗应为4-8欧姆");
-                Serial.println("\n详细故障排查请查看: MAX98357A_TROUBLESHOOTING.md");
-                Serial.println("====================================\n");
-            } else if (command.startsWith("chat ")) {
-                // 提取聊天消息
-                String message = input.substring(5);
-                if (aiInitialized) {
-                    Serial.printf("你: %s\n", message.c_str());
-                    String response = chatWithDeepSeek(message);
-                    Serial.printf("小智: %s\n", response.c_str());
-                } else {
-                    Serial.println("AI服务未初始化，请检查网络连接");
-                }
-            } else {
-                // 尝试作为聊天消息处理
-                if (aiInitialized && input.length() > 0) {
-                    Serial.printf("你: %s\n", input.c_str());
-                    String response = chatWithDeepSeek(input);
-                    Serial.printf("小智: %s\n", response.c_str());
-                } else if (!aiInitialized) {
-                    Serial.println("AI服务未初始化，请检查网络连接或输入'ai'查看状态");
-                } else {
-                    Serial.printf("[CMD] ✗ Unknown command: '%s'\n", command.c_str());
-                    Serial.println("[HELP] Type 'help' to see available commands");
-                }
-            }
-        }
-    }
+    processSerialCommands();
     
     // 处理实时录音（实时传输音频数据）
-    if (isRecording) {
-        size_t bytes_read = 0;
-        int32_t i2s_buffer[512];  // 32位I2S缓冲区，512样本×4字节=2048字节
-        
-        esp_err_t result = i2s_read(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytes_read, 100);
-        
-        if (result == ESP_OK && bytes_read > 0) {
-            // 首帧时间戳日志（用于验证采样延迟）
-            static bool firstFrame = true;
-            if (firstFrame) {
-                unsigned long firstFrameTime = millis();
-                unsigned long delayFromPress = firstFrameTime - recordingStartTime;
-                Serial.printf("[REALTIME] ★ 首帧采样完成 t=%lu ms, 距按键 %lu ms\n", 
-                              firstFrameTime, delayFromPress);
-                firstFrame = false;
-            }
-            
-            // 转换32位数据到16位
-            size_t samples_read = bytes_read / 4;  // 32位 = 4字节
-            uint8_t pcm_buffer[samples_read * 2];  // 16位 = 2字节
-            int16_t* output_ptr = (int16_t*)pcm_buffer;
-            
-            for (size_t i = 0; i < samples_read; i++) {
-                // INMP441的数据在32位的高18位，右移14位得到16位数据
-                output_ptr[i] = (int16_t)(i2s_buffer[i] >> 14);
-            }
-            
-            // 优先缓存音频，异步建立连接
-            if (!realtimeASR.isConnected()) {
-                // 先缓存当前帧
-                if (audioCache && audioCacheSize + samples_read * 2 < AUDIO_CACHE_SIZE) {
-                    memcpy(audioCache + audioCacheSize, pcm_buffer, samples_read * 2);
-                    audioCacheSize += samples_read * 2;
-                }
-                
-                // 异步尝试连接（首次立即尝试，之后每200ms重试）
-                static unsigned long lastConnectAttempt = 0;
-                static bool firstConnectAttempt = true;
-                unsigned long now = millis();
-                
-                if (isConnecting && (firstConnectAttempt || now - lastConnectAttempt > 200)) {
-                    if (firstConnectAttempt) {
-                        Serial.printf("[REALTIME] 开始异步连接ASR (t=%lu ms, 已缓存 %d bytes)\n", 
-                                      now, audioCacheSize);
-                        firstConnectAttempt = false;
-                    }
-                    
-                    if (realtimeASR.connect()) {
-                        unsigned long connectTime = millis();
-                        Serial.printf("[REALTIME] ★ ASR连接成功 t=%lu ms (耗时 %lu ms)\n", 
-                                      connectTime, connectTime - recordingStartTime);
-                        isConnecting = false;
-                        firstConnectAttempt = true;  // 重置供下次使用
-                        
-                        // 立即发送所有缓存
-                        if (audioCacheSize > 0) {
-                            Serial.printf("[REALTIME] ★ 发送缓存音频: %d bytes (t=%lu ms)\n", 
-                                          audioCacheSize, millis());
-                            realtimeASR.sendAudioData(audioCache, audioCacheSize);
-                            recordedSize += audioCacheSize;
-                            audioCacheSize = 0;
-                        }
-                        
-                        // 发送当前帧
-                        realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
-                        recordedSize += samples_read * 2;
-                    } else {
-                        // 定期输出缓存状态
-                        static unsigned long lastCacheLog = 0;
-                        if (now - lastCacheLog > 500) {
-                            Serial.printf("[REALTIME] 连接中...已缓存 %d bytes\n", audioCacheSize);
-                            lastCacheLog = now;
-                        }
-                    }
-                    lastConnectAttempt = now;
-                }
-            } else {
-                // 已连接，直接发送
-                realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
-                recordedSize += samples_read * 2;
-                
-                // 定期输出进度
-                static unsigned long lastProgressLog = 0;
-                if (millis() - lastProgressLog > 1000) {
-                    Serial.printf("[REALTIME] 已发送 %d bytes\n", recordedSize);
-                    lastProgressLog = millis();
-                }
-            }
-        }
-    } else {
-        // 重置首帧标记（停止录音时）
-        static bool firstFrame = true;
-        firstFrame = true;
-    }
+    handleRealtimeRecording();
 }
