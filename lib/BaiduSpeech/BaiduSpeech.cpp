@@ -816,9 +816,9 @@ bool BaiduSpeech::synthesizeSpeechStream(const String& text,
     while (stream->connected() || stream->available()) {
         available = stream->available();
         if (available == 0) {
-            // 检查超时：如果5秒内没有新数据，认为传输结束
-            if (millis() - lastDataTime > 5000) {
-                Serial.println("[TTS-STREAM] 5秒无数据，传输结束");
+            // 检查超时：如果0.5秒内没有新数据，认为传输结束
+            if (millis() - lastDataTime > 500) {
+                Serial.println("[TTS-STREAM] 0.5秒无数据，传输结束");
                 break;
             }
             delay(1);

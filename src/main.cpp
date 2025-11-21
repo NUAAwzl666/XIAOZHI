@@ -2054,6 +2054,25 @@ void loop() {
                 setupBaiduSpeech();
             }
             
+            // 检查是否所有服务都已初始化，并且之前未标记为完全初始化
+            if (!systemFullyInitialized && aiInitialized && speechInitialized && realtimeASRInitialized) {
+                systemFullyInitialized = true;
+                Serial.println("\n[SYSTEM] ✓ 所有服务初始化完成（WiFi重连后）！");
+                
+                // 播放初始化完成提示音
+                delay(500);
+                Serial.println("[SYSTEM] 播放初始化完成提示...");
+                speakTextStream("初始化已完成，现在可以开始了");
+                
+                // LED快速闪烁5次表示系统就绪
+                for (int i = 0; i < 5; i++) {
+                    digitalWrite(LED_PIN, HIGH);
+                    delay(100);
+                    digitalWrite(LED_PIN, LOW);
+                    delay(100);
+                }
+            }
+            
         } else if (!isConnected && wasConnected) {
             Serial.println("[WIFI] ✗ WiFi connection lost!");
             aiInitialized = false; // WiFi断开时禁用AI
