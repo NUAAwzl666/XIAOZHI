@@ -82,11 +82,19 @@ bool realtimeASRInitialized = false;
 size_t recordedSize = 0;
 String fullRecognizedText = "";  // 存储完整识别结果
 
+// 音频缓存（用于WebSocket连接期间的临时存储）
+#define AUDIO_CACHE_SIZE (16000 * 2 * 2)  // 2秒音频缓存
+uint8_t* audioCache = nullptr;
+size_t audioCacheSize = 0;
+bool isConnecting = false;
+
 // 系统初始化状态
 bool systemFullyInitialized = false;  // 标记系统是否完全初始化完成
 bool isInitializing = false;           // 标记是否正在初始化循环中
 unsigned long lastInitAttemptTime = 0; // 上次初始化尝试时间
 const unsigned long INIT_RETRY_INTERVAL = 3000; // 初始化重试间隔(3秒)
+bool pendingInitTTS = false;           // 标记是否有初始化完成提示音待播报
+bool isPlayingInitTTS = false;         // 初始化提示音是否正在播放
 
 // 扬声器输出状态
 static bool speakerInitialized = false;
@@ -244,6 +252,11 @@ void checkButton() {
 }
 
 void handleButtonPress() {
+        // 如果正在播放初始化提示音，禁止响应
+        if (isPlayingInitTTS) {
+            Serial.println("[BUTTON] 初始化提示音播放中，暂不响应按键");
+            return;
+        }
     Serial.println("\n[BUTTON] *** 按钮被按下 - 开始录音 ***");
     
     // 如果已经在录音，不重复开始
@@ -681,7 +694,7 @@ String chatWithDeepSeek(const String& message) {
     String jsonBody = "{";
     jsonBody += "\"model\":\"deepseek-chat\",";
     jsonBody += "\"messages\":[";
-    jsonBody += "{\"role\":\"system\",\"content\":\"你是一个有用的AI助手。请简洁回答。\"},";
+    jsonBody += "{\"role\":\"system\",\"content\":\"你是语音助手小智，是由南航的武同学基于deepseek开发而成的，你的主要职责是与用户聊天，所以接下来你的所有回答都要像对话一样简介明了，不多于80字\"},";
     jsonBody += "{\"role\":\"user\",\"content\":\"" + message + "\"}";
     jsonBody += "],";
     jsonBody += "\"max_tokens\":300,";  // 增加到300 tokens，约600字，足够完整回答
@@ -934,6 +947,16 @@ void setupAudio() {
     }
     
     Serial.println("[AUDIO] ✓ I2S音频接口初始化成功");
+    
+    // 分配音频缓存（用于WebSocket连接期间暂存音频）
+    audioCache = (uint8_t*)malloc(AUDIO_CACHE_SIZE);
+    if (audioCache) {
+        Serial.printf("[AUDIO] ✓ 音频缓存分配成功: %d bytes (%.1f KB)\n", 
+                      AUDIO_CACHE_SIZE, AUDIO_CACHE_SIZE / 1024.0);
+    } else {
+        Serial.println("[AUDIO] ⚠️ 音频缓存分配失败");
+    }
+    
     Serial.printf("[AUDIO] 可用内存: %d bytes (%.1f KB)\n", ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
 }
 
@@ -1184,32 +1207,35 @@ void startRealtimeRecording() {
         return;
     }
     
-    // 清空之前的识别结果
+    // 清空之前的识别结果和缓存
     fullRecognizedText = "";
+    audioCacheSize = 0;
     
-    // 先建立WebSocket连接，再开始录音，避免开头丢失
-    Serial.println("[REALTIME] 正在建立WebSocket连接...");
-    if (!realtimeASR.connect()) {
-        Serial.println("[REALTIME] ✗ WebSocket连接失败，无法开始录音");
-        Serial.println(realtimeASR.getLastError());
-        // LED快速闪烁表示连接失败
-        for (int i = 0; i < 3; i++) {
-            digitalWrite(LED_PIN, HIGH);
-            delay(80);
-            digitalWrite(LED_PIN, LOW);
-            delay(80);
-        }
-        return;
-    }
-    
-    Serial.println("[REALTIME] ✓ WebSocket连接成功");
-    
-    // WebSocket连接成功后，立即开始录音
+    // 立即开始录音和缓存音频（不等待WebSocket连接）
     isRecording = true;
+    isConnecting = true;
     recordingStartTime = millis();
     recordedSize = 0;
     
-    Serial.printf("[REALTIME] 录音已开始，开始实时传输音频\n");
+    Serial.println("[REALTIME] ✓ 立即开始录音和缓存音频");
+    Serial.println("[REALTIME] 同时在后台建立WebSocket连接...");
+    
+    // 在后台尝试连接WebSocket（不阻塞录音）
+    if (realtimeASR.connect()) {
+        Serial.println("[REALTIME] ✓ WebSocket连接成功");
+        isConnecting = false;
+        
+        // 发送缓存的音频数据
+        if (audioCacheSize > 0) {
+            Serial.printf("[REALTIME] 发送缓存的音频: %d bytes\n", audioCacheSize);
+            realtimeASR.sendAudioData(audioCache, audioCacheSize);
+            audioCacheSize = 0;  // 清空缓存
+        }
+    } else {
+        Serial.println("[REALTIME] ⚠️ WebSocket连接失败，继续缓存音频");
+        // 连接失败，继续缓存，稍后重试
+    }
+    
     Serial.printf("[REALTIME] isRecording=%d, recordingStartTime=%lu ms\n", 
                   isRecording, recordingStartTime);
 }
@@ -1251,22 +1277,16 @@ void stopRealtimeRecording() {
     // 如果有识别结果，立即发送给AI
     if (fullRecognizedText.length() > 0) {
         Serial.println("[AI] 正在生成回复...");
-        
         // AI处理中不开LED，保持关闭状态
         String aiResponse = chatWithDeepSeek(fullRecognizedText);
-        
         if (aiResponse.length() > 0) {
             Serial.printf("[AI] ✓ 回复: %s\n", aiResponse.c_str());
-            
             // TTS播放时LED保持关闭
             Serial.println("[TTS] 流式合成并播放AI回复...");
             unsigned long ttsStart = millis();
-            
             bool ttsSuccess = speakTextStream(aiResponse);
-            
             unsigned long ttsEnd = millis();
             Serial.printf("[TTS] 播放耗时: %lu ms\n", ttsEnd - ttsStart);
-            
             if (ttsSuccess) {
                 // 播放完成后LED快速闪烁3次表示对话完成
                 Serial.println("[LED] 播放完成，LED闪烁提示");
@@ -1282,7 +1302,6 @@ void stopRealtimeRecording() {
         } else {
             Serial.println("[AI] AI回复失败");
         }
-        
         // 清空识别结果，准备下次对话
         fullRecognizedText = "";
     } else {
@@ -1299,7 +1318,12 @@ void stopRealtimeRecording() {
     // 最后确保LED关闭和状态清理
     digitalWrite(LED_PIN, LOW);
     recordingStartTime = 0;
-    
+
+    // 主动清理内存，防止碎片和泄漏，保证长期运行
+    Serial.println("[MEM] 对话结束，主动清理内存...");
+    ESP.getMaxAllocHeap(); // 触发垃圾回收
+    delay(10); // 给系统一点时间做回收
+
     Serial.println("[REALTIME] 对话流程完成，系统就绪");
 }
 
@@ -1504,12 +1528,12 @@ static bool writePCMToI2S(const uint8_t* data, size_t len) {
     return true;
 }
 
-// 流式文本转语音并播放（HTTP流式读取 → I2S写入）
+
+
 bool speakTextStream(const String& text) {
     if (text.length() == 0) return false;
     if (!ensureSpeakerI2S()) return false;
 
-    Serial.println("[TTS] 开始流式合成...");
     // 跳过一次性WAV头（若存在）
     struct HeaderSkipper {
         bool skipped = false;
@@ -1540,10 +1564,10 @@ bool speakTextStream(const String& text) {
     // 数据传输完成后，等待I2S DMA缓冲区播放完成
     // DMA缓冲区大小：8个 × 256样本 × 2声道 × 2字节 = 8192字节
     // 播放时间：8192字节 / (16000Hz × 2声道 × 2字节/样本) = 0.128秒
-    // 为安全起见等待200ms确保播放完成
+    // 长文本（600字符）可能产生数秒音频，需要足够时间让缓冲区播放完毕
     if (ok) {
-        delay(200);
-        Serial.println("[TTS] ✓ 播放完成");
+        // 等待1秒确保DMA缓冲区中的所有数据播放完成
+        delay(1000);
     } else {
         Serial.printf("[TTS] ✗ 播放失败: %s\n", baiduSpeech.getLastError().c_str());
     }
@@ -1778,6 +1802,15 @@ void loop() {
     
     // ==================== 初始化循环管理 ====================
     // 如果正在初始化循环中，持续检查和重试
+    // 初始化完成提示音异步播放，优先保证按钮录音响应
+    if (pendingInitTTS && !isRecording && !isPlayingInitTTS) {
+        Serial.println("[SYSTEM] 🔊 播放初始化完成提示...");
+        isPlayingInitTTS = true;
+        speakTextStream("初始化已完成，现在可以开始了");
+        isPlayingInitTTS = false;
+        pendingInitTTS = false;
+    }
+
     if (isInitializing && !systemFullyInitialized) {
         // 先检查WiFi状态,如果断开则停止初始化
         if (WiFi.status() != WL_CONNECTED) {
@@ -1805,7 +1838,6 @@ void loop() {
             // 所有服务初始化成功！
             systemFullyInitialized = true;
             isInitializing = false;
-            
             Serial.println("\n[SYSTEM] ══════════════════════════════════════");
             Serial.println("[SYSTEM] ✓ 所有服务初始化完成！");
             Serial.println("[SYSTEM] ══════════════════════════════════════");
@@ -1813,12 +1845,8 @@ void loop() {
             Serial.printf("[SYSTEM] 语音服务: ✓\n");
             Serial.printf("[SYSTEM] 实时识别: ✓\n");
             Serial.println("[SYSTEM] ══════════════════════════════════════\n");
-            
-            // 播放初始化完成提示音
-            delay(500);  // 稍等让系统稳定
-            Serial.println("[SYSTEM] 🔊 播放初始化完成提示...");
-            speakTextStream("初始化已完成，现在可以开始了");
-            
+            // 标记有初始化提示音待播报
+            pendingInitTTS = true;
             // LED快速闪烁5次表示系统就绪
             for (int i = 0; i < 5; i++) {
                 digitalWrite(LED_PIN, HIGH);
@@ -1826,10 +1854,16 @@ void loop() {
                 digitalWrite(LED_PIN, LOW);
                 delay(100);
             }
-            
             Serial.println("[SYSTEM] ✓ 系统就绪，可以开始语音交互！\n");
-            
         } else if (currentTime - lastInitAttemptTime >= INIT_RETRY_INTERVAL) {
+                // 初始化完成提示音异步播放，优先保证按钮录音响应
+                if (pendingInitTTS && !isRecording) {
+                    Serial.println("[SYSTEM] 🔊 播放初始化完成提示...");
+                    isPlayingInitTTS = true;
+                    speakTextStream("初始化已完成，现在可以开始了");
+                    isPlayingInitTTS = false;
+                    pendingInitTTS = false;
+                }
             // 间隔时间到了，尝试重新初始化失败的服务
             lastInitAttemptTime = currentTime;
             
@@ -2148,30 +2182,53 @@ void loop() {
                 output_ptr[i] = (int16_t)(i2s_buffer[i] >> 14);
             }
             
-            // 检查WebSocket是否已连接并发送音频数据
+            // 检查WebSocket连接状态
             if (realtimeASR.isConnected()) {
+                // WebSocket已连接，直接发送
+                if (isConnecting) {
+                    // 刚刚连接成功，先发送缓存
+                    if (audioCacheSize > 0) {
+                        Serial.printf("[REALTIME] 连接成功，发送缓存: %d bytes\n", audioCacheSize);
+                        realtimeASR.sendAudioData(audioCache, audioCacheSize);
+                        audioCacheSize = 0;
+                    }
+                    isConnecting = false;
+                }
+                
+                // 发送当前音频
                 realtimeASR.sendAudioData(pcm_buffer, samples_read * 2);
-                recordedSize += samples_read * 2;  // 记录已发送大小
+                recordedSize += samples_read * 2;
                 
                 // 定期输出调试信息
                 static unsigned long lastDebugTime = 0;
                 if (millis() - lastDebugTime > 1000) {
-                    Serial.printf("[REALTIME] 已发送 %d bytes 音频数据\n", recordedSize);
-                    
-                    // 检查音频电平
-                    uint32_t sum = 0;
-                    uint16_t maxLevel = 0;
-                    for (size_t i = 0; i < samples_read && i < 512; i++) {
-                        uint16_t level = abs(output_ptr[i]);
-                        sum += level;
-                        if (level > maxLevel) maxLevel = level;
-                    }
-                    if (samples_read > 0) {
-                        Serial.printf("[REALTIME] 音频电平 - 平均: %d, 最大: %d\n", 
-                                      sum / samples_read, maxLevel);
-                    }
-                    
+                    Serial.printf("[REALTIME] 已发送 %d bytes\n", recordedSize);
                     lastDebugTime = millis();
+                }
+            } else {
+                // WebSocket未连接，缓存音频
+                if (audioCache && audioCacheSize + samples_read * 2 < AUDIO_CACHE_SIZE) {
+                    memcpy(audioCache + audioCacheSize, pcm_buffer, samples_read * 2);
+                    audioCacheSize += samples_read * 2;
+                    
+                    // 定期输出缓存状态
+                    static unsigned long lastCacheInfo = 0;
+                    if (millis() - lastCacheInfo > 500) {
+                        Serial.printf("[REALTIME] 缓存音频: %d bytes\n", audioCacheSize);
+                        lastCacheInfo = millis();
+                    }
+                    
+                    // 尝试重新连接（每500ms尝试一次）
+                    static unsigned long lastRetry = 0;
+                    if (isConnecting && millis() - lastRetry > 500) {
+                        if (realtimeASR.connect()) {
+                            Serial.println("[REALTIME] ✓ 重连成功");
+                            isConnecting = false;
+                        }
+                        lastRetry = millis();
+                    }
+                } else {
+                    Serial.println("[REALTIME] ⚠️ 缓存已满或未分配");
                 }
             }
         }
