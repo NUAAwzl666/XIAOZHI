@@ -466,9 +466,11 @@ void checkWiFiStatus() {
             playWarningBeep();
             delay(100);  // 短暂延迟让提示音播放完成
 
-            // 若未在录音，TTS语音播报断网提示
+            // 若未在录音，尝试TTS语音播报断网提示（可能因DNS失败而无效）
             if (!isRecording) {
                 setLEDMode(LED_BLINK_FAST);
+                // 注意：此时网络已断开，TTS可能失败，但会播放警告音
+                // speakTextStream内部会检查WiFi状态并快速返回
                 speakTextStream("网络已断开，请检查WiFi连接");
             }
         }
@@ -1565,6 +1567,47 @@ bool speakTextStream(const String& text) {
     if (text.length() == 0) return false;
     if (!ensureSpeakerI2S()) return false;
 
+    // 检查WiFi连接状态
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[TTS-STREAM] ✗ WiFi未连接，无法进行TTS合成");
+        return false;
+    }
+
+    // 测试DNS解析（百度TTS服务器）
+    IPAddress ip;
+    if (!WiFi.hostByName("tsn.baidu.com", ip)) {
+        Serial.println("[TTS-STREAM] ⚠ DNS解析失败，尝试重新连接WiFi...");
+        
+        // 尝试刷新DNS
+        WiFi.disconnect();
+        delay(1000);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        
+        int waitCount = 0;
+        while (WiFi.status() != WL_CONNECTED && waitCount < 10) {
+            delay(1000);
+            waitCount++;
+            Serial.print(".");
+        }
+        Serial.println();
+        
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[TTS-STREAM] ✗ WiFi重连失败");
+            return false;
+        }
+        
+        Serial.printf("[TTS-STREAM] ✓ WiFi重连成功，IP: %s\n", WiFi.localIP().toString().c_str());
+        
+        // 再次测试DNS
+        if (!WiFi.hostByName("tsn.baidu.com", ip)) {
+            Serial.println("[TTS-STREAM] ✗ DNS解析仍然失败");
+            return false;
+        }
+        Serial.printf("[TTS-STREAM] ✓ DNS解析成功: %s\n", ip.toString().c_str());
+    } else {
+        Serial.printf("[TTS-STREAM] ✓ DNS正常: tsn.baidu.com -> %s\n", ip.toString().c_str());
+    }
+
     // 跳过一次性WAV头（若存在）
     struct HeaderSkipper {
         bool skipped = false;
@@ -1638,7 +1681,22 @@ bool speakTextStream(const String& text) {
         // （避免过长延迟截断长文本，同时留足够时间播完缓冲数据）
         delay(1200);
     } else {
-        Serial.printf("[TTS] ✗ 播放失败: %s\n", baiduSpeech.getLastError().c_str());
+        String error = baiduSpeech.getLastError();
+        Serial.printf("[TTS] ✗ 播放失败: %s\n", error.c_str());
+        
+        // 检查是否是网络错误
+        if (error.indexOf("DNS") >= 0 || error.indexOf("Failed") >= 0 || error.indexOf("HTTP error -1") >= 0) {
+            Serial.println("[TTS] 检测到网络错误，建议检查WiFi连接");
+            
+            // 检查WiFi状态
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("[TTS] WiFi已断开，触发重连机制");
+                checkWiFiStatus();
+            } else {
+                Serial.printf("[TTS] WiFi连接正常 (IP: %s)，可能是DNS或服务器问题\n", 
+                             WiFi.localIP().toString().c_str());
+            }
+        }
     }
     return ok;
 }
